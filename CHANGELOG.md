@@ -1,5 +1,10 @@
 # 更新日志 (CHANGELOG)
 
+- **v1.20.1**:
+  - **Cookie 文件**: 新增插件数据目录 `cookies/weibo_cookie.txt`，配置为空时自动读取；配置或命令更新时同步写入。
+  - **格式兼容**: 支持普通 `Cookie` 请求头和 Netscape cookies.txt，接受 `weibo.com`、`weibo.cn` 及其子域记录。
+  - **会话续期**: 已认证的微博响应若下发 `Set-Cookie`，自动合并并持久化新值；Cookie 的最终有效期仍由微博服务端决定。
+
 - **v1.20.0**:
   - **总结调度**: 移除固定 08:00 的旧兜底分支；每日总结现严格按 UTC+8 的 `daily_summary_time`（`HH:MM`）触发，错过设定时间后当日仍会补发。
   - **管理员权限**: `/weibo_export`、`/weibo_import` 和 `/weibo_cookie` 改为 AstrBot 管理员指令，直接复用全局 `admins_id`，防止普通成员导出 Cookie 或覆盖配置。

@@ -18,6 +18,11 @@ from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api.web import error_response, json_response, request
 from bs4 import BeautifulSoup
 import astrbot.api.message_components as Comp
+from .weibo_cookies import (
+    WeiboCookieFile,
+    merge_set_cookie_headers,
+    normalize_cookie_text,
+)
 
 # 常量定义
 DEFAULT_CHECK_INTERVAL = 10  # 默认检查间隔（分钟）
@@ -89,7 +94,7 @@ CONFIG_KEY_GROUPS = {
     "astrbot_plugin_weibo_monitor",
     "Sayaka",
     "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。",
-    "v1.20.0",
+    "v1.20.1",
     "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor",
 )
 class WeiboMonitor(Star):
@@ -115,6 +120,10 @@ class WeiboMonitor(Star):
         self.temp_images_dir = self.data_dir / "temp_images"
         if not self.temp_images_dir.exists():
             self.temp_images_dir.mkdir(parents=True, exist_ok=True)
+        self.cookies_dir = self.data_dir / "cookies"
+        self.cookies_dir.mkdir(parents=True, exist_ok=True)
+        self.cookie_file = WeiboCookieFile(self.cookies_dir / "weibo_cookie.txt")
+        self._cookie_refresh_lock = asyncio.Lock()
 
         # 初始化日志
         self.plugin_logger = logging.getLogger("astrbot_plugin_weibo_monitor")
@@ -136,6 +145,7 @@ class WeiboMonitor(Star):
             transport=transport,
             follow_redirects=True,
             limits=self.limits,
+            event_hooks={"response": [self._capture_weibo_cookie_updates]},
         )
         self.running = True
         self.session_initialized_uids: set[str] = set()
@@ -172,16 +182,7 @@ class WeiboMonitor(Star):
         # 迁移旧版配置：将 target_conversation_id 合并到 subscription_mappings（同步，确保在 run_monitor 前完成）
         self._migrate_config_v2()
 
-        # 检查Cookie是否配置，若框架配置为空则尝试从 _data 兜底恢复
-        if not self._get_config("weibo_cookie", ""):
-            backup_cookie = self._data.get("_backup_weibo_cookie", "")
-            if backup_cookie:
-                self._set_config("weibo_cookie", backup_cookie)
-                self.plugin_logger.info("WeiboMonitor: 从持久化数据中恢复了微博 Cookie")
-            else:
-                self.plugin_logger.warning(
-                    "WeiboMonitor: 未配置微博 Cookie，微博动态自动监控将暂停；免 Cookie 热搜等独立功能不受此提示影响。"
-                )
+        self._initialize_cookie_value()
 
         # Cookie 内容变化后必须重新验证，不能沿用旧 Cookie 的健康状态。
         configured_cookie = self._get_cookie_value()
@@ -873,9 +874,74 @@ class WeiboMonitor(Star):
             return match.group(1) if match else ""
 
     def _get_cookie_value(self) -> str:
-        """返回去除首尾空白后的 Cookie，避免空白字符串被误判为已配置。"""
+        """返回规范化 Cookie，兼容请求头与 Netscape 文件内容。"""
         value = self._get_config("weibo_cookie", "")
-        return str(value).strip() if value is not None else ""
+        return normalize_cookie_text(str(value)) if value is not None else ""
+
+    def _initialize_cookie_value(self):
+        """配置优先；配置为空时从 Cookie 文件或旧备份恢复。"""
+        configured_cookie = self._get_cookie_value()
+        file_cookie = self.cookie_file.load()
+        backup_cookie = normalize_cookie_text(self._data.get("_backup_weibo_cookie", ""))
+
+        if configured_cookie:
+            self._set_config("weibo_cookie", configured_cookie)
+            if not self.cookie_file.save(configured_cookie):
+                self.plugin_logger.warning(
+                    "WeiboMonitor: 无法写入 cookies/weibo_cookie.txt，请检查插件数据目录权限"
+                )
+            return
+        if file_cookie:
+            self._set_config("weibo_cookie", file_cookie)
+            self._data["_backup_weibo_cookie"] = file_cookie
+            self.plugin_logger.info(
+                "WeiboMonitor: 已从 cookies/weibo_cookie.txt 加载微博 Cookie"
+            )
+            return
+        if backup_cookie:
+            self._set_config("weibo_cookie", backup_cookie)
+            self.cookie_file.save(backup_cookie)
+            self.plugin_logger.info("WeiboMonitor: 从持久化数据中恢复了微博 Cookie")
+            return
+        self.plugin_logger.warning(
+            "WeiboMonitor: 未配置微博 Cookie，微博动态自动监控将暂停；免 Cookie 热搜等独立功能不受此提示影响。"
+        )
+
+    async def _capture_weibo_cookie_updates(self, response: httpx.Response):
+        """接收微博 Set-Cookie 并回写本地文件，尽可能延续服务端会话。"""
+        if not response.request.headers.get("Cookie"):
+            return
+        set_cookie_headers = response.headers.get_list("set-cookie")
+        if not set_cookie_headers:
+            return
+
+        async with self._cookie_refresh_lock:
+            refreshed_cookie, accepted, changed = merge_set_cookie_headers(
+                self._get_cookie_value(),
+                set_cookie_headers,
+                response.request.url.host or "",
+            )
+            if not accepted or not refreshed_cookie or not changed:
+                return
+            if not self.cookie_file.save(refreshed_cookie):
+                self.plugin_logger.warning(
+                    "WeiboMonitor: 微博下发了 Cookie 更新，但 weibo_cookie.txt 写入失败"
+                )
+                return
+            self._set_config("weibo_cookie", refreshed_cookie)
+            self._data["_backup_weibo_cookie"] = refreshed_cookie
+            self._data["_cookie_fingerprint"] = self._cookie_fingerprint(
+                refreshed_cookie
+            )
+            self._save_data()
+            if not await self._save_plugin_config_async("微博 Cookie 自动刷新"):
+                self.plugin_logger.warning(
+                    "WeiboMonitor: 自动刷新后的 Cookie 已写入本地文件，但框架配置保存失败"
+                )
+            else:
+                self.plugin_logger.info(
+                    "WeiboMonitor: 已接收微博下发的新 Cookie 并同步到本地文件"
+                )
 
     @staticmethod
     def _cookie_fingerprint(cookie: str) -> str:
@@ -2009,7 +2075,7 @@ class WeiboMonitor(Star):
                 "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
                 "Referer": "https://m.weibo.cn/",
             }
-            cookie = self._get_config("weibo_cookie", "")
+            cookie = self._get_cookie_value()
             if cookie:
                 headers["Cookie"] = cookie
             async with self._request_semaphore:
@@ -2053,7 +2119,7 @@ class WeiboMonitor(Star):
             "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
             "Referer": "https://m.weibo.cn/",
         }
-        cookie = self._get_config("weibo_cookie", "")
+        cookie = self._get_cookie_value()
         if cookie:
             headers["Cookie"] = cookie
 
@@ -2609,6 +2675,12 @@ class WeiboMonitor(Star):
                 )
                 return
 
+            if cookie_explicitly_imported and imported_cookie:
+                if not self.cookie_file.save(imported_cookie):
+                    self.plugin_logger.warning(
+                        "WeiboMonitor: 配置已导入，但 cookies/weibo_cookie.txt 写入失败"
+                    )
+
             # 只有全部持久化完成后才应用日志配置等运行时副作用。
             try:
                 self.setup_logging()
@@ -2638,7 +2710,7 @@ class WeiboMonitor(Star):
     @filter.command("weibo_verify")
     async def weibo_verify(self, event: AstrMessageEvent):
         """验证当前配置的 Cookie 是否有效"""
-        cookie = self._get_config("weibo_cookie", "")
+        cookie = self._get_cookie_value()
         if not cookie:
             yield event.plain_result("❌ 未配置 Cookie。")
             return
@@ -2724,12 +2796,15 @@ class WeiboMonitor(Star):
             return
 
         backup_saved = self._save_data()
+        cookie_file_saved = self.cookie_file.save(cookie)
         if backup_saved:
             persistence_message = "✅ 配置与插件兜底备份均已持久化保存"
         else:
             persistence_message = (
                 "⚠️ 主配置已持久化，但插件兜底备份保存失败；请检查插件数据目录权限"
             )
+        if not cookie_file_saved:
+            persistence_message += "；⚠️ cookies/weibo_cookie.txt 写入失败"
 
         yield event.plain_result(
             f"🔄 Cookie 已可靠保存，正在验证有效性...\n{persistence_message}"

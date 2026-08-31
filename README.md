@@ -10,7 +10,7 @@
 - **定时监控**：自定义检查频率，支持间隔随机化避免被反爬。
 - **多用户支持**：可同时监控多个微博账号，支持URL、UID、用户名三种输入格式。
 - **精准推送**：仅推送最新更新，自动过滤置顶微博。
-- **Cookie 配置**：必须配置微博 Cookie 才能正常抓取数据，确保稳定性。
+- **Cookie 配置**：支持配置项或插件数据目录 `cookies/weibo_cookie.txt`，兼容请求头与 Netscape 格式。
 - **灵活过滤**：支持屏蔽词过滤、白名单关键词过滤，可选择是否推送原创/转发微博。
 - **消息自定义**：支持自定义推送消息格式，满足不同需求。
 - **配置导入导出**：支持配置的导入导出，方便迁移和备份。
@@ -55,7 +55,7 @@
    机器人会返回当前会话的 ID，请记录下来。
 
 4. **配置插件**：
-   在 AstrBot 管理面板 -> 插件设置 -> `weibo_monitor` 中，按卡片配置 Cookie、监控频率、微博推送内容、图片与视频等项目。`weibo_cookie` 为必填项。
+   在 AstrBot 管理面板 -> 插件设置 -> `weibo_monitor` 中，按卡片配置 Cookie、监控频率、微博推送内容、图片与视频等项目。也可将 Cookie 保存到插件数据目录的 `cookies/weibo_cookie.txt`；配置项为空时插件会自动读取该文件。
 
 5. **配置监控与推送目标**：
    打开本插件详情页的 **订阅分组管理** Page：
@@ -308,21 +308,23 @@ group_fans_C: 2534531481, 5310078607, https://weibo.com/n/某明星
 
 ### Cookie 必填提醒
 
-⚠️ **微博Cookie为必填项**，插件虽然允许在未配置 Cookie 时启动，但**必须配置 Cookie 后才能正常抓取数据**。请务必按照下方步骤获取并配置Cookie。
+⚠️ 微博动态抓取必须有可用 Cookie。可填写配置项，也可只提供 `cookies/weibo_cookie.txt`；两处都没有时插件仍可启动，但会暂停微博动态监控。
 
 ### 如何获取微博 Cookie
 
-1. 在电脑浏览器打开 [微博移动端官网](https://m.weibo.cn/) 并登录。
+1. 在电脑浏览器打开 [微博移动端官网](https://m.weibo.cn/) 或 [微博网页版](https://weibo.com/) 并登录。
 2. 按 `F12` 打开开发者工具，切换到 `网络 (Network)` 选项卡。
-3. 刷新页面，在左侧列表中找到第一个 `m.weibo.cn` 的请求（或者任何一个 `getIndex` 请求）。
+3. 刷新页面，在左侧列表中找到 `m.weibo.cn` 或 `weibo.com` 请求。
 4. 在右侧的 `请求标头 (Request Headers)` 中找到 `Cookie` 字段。
-5. 复制该字段的完整值，粘贴到插件设置的 `weibo_cookie` 中。
+5. 复制该字段的完整值，粘贴到插件设置的 `weibo_cookie` 中；也可保存到插件数据目录的 `cookies/weibo_cookie.txt`。
 
 ### Cookie 注意事项
 
 - Cookie具有有效期，失效后需要重新获取
+- `weibo_cookie.txt` 支持浏览器导出的 Netscape 格式和 `name=value; ...` 请求头格式，并接受 `weibo.com`、`weibo.cn` 及其子域 Cookie
+- 微博响应下发新的 `Set-Cookie` 时插件会自动合并并回写文件，尽可能延续会话；服务端若不续期或主动使登录失效，仍需重新获取 Cookie
 - 请勿在多设备同时登录同一账号，可能导致Cookie失效
-- 获取Cookie时请确保使用微博移动端官网 (m.weibo.cn)，而非PC端官网
+- 移动端与网页版 Cookie 都可使用；建议保留浏览器导出的全部微博域 Cookie
 - 配置完成后可使用 `/weibo_verify` 指令验证Cookie是否有效
 
 ## 常见问题
