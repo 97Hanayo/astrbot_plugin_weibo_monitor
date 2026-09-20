@@ -1,5 +1,11 @@
 # 更新日志 (CHANGELOG)
 
+## 未发布
+
+- **Cookie 持久化修复**：插件重载时优先使用 `cookies/weibo_cookies.txt` 中的已续期 Cookie，避免旧配置覆盖服务端更新值。
+- **Cookie 保活**：默认每 12 小时请求一次微博首页，捕获真实 `Set-Cookie` 并原子写回本地文件；新增可配置的开关和间隔。
+- **文件名兼容**：统一识别 `cookies/weibo_cookies.txt`，首次启动时自动迁移旧的 `weibo_cookie.txt`。
+
 - **v1.20.1**:
   - **Cookie 文件**: 新增插件数据目录 `cookies/weibo_cookie.txt`，配置为空时自动读取；配置或命令更新时同步写入。
   - **格式兼容**: 支持普通 `Cookie` 请求头和 Netscape cookies.txt，接受 `weibo.com`、`weibo.cn` 及其子域记录。

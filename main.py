@@ -35,6 +35,7 @@ DEFAULT_MESSAGE_TEMPLATE = "🔔 {name} 发微博啦！\n\n{weibo}\n\n链接: {l
 WEIBO_API_BASE = "https://m.weibo.cn/api/container/getIndex"
 WEIBO_MOBILE_BASE = "https://m.weibo.cn"
 WEIBO_WEB_BASE = "https://weibo.com"
+WEIBO_COOKIE_REFRESH_URL = f"{WEIBO_WEB_BASE}/"
 HOTSEARCH_API_URL = "https://weibo.com/ajax/side/hotSearch"
 DEFAULT_HOTSEARCH_INTERVAL = 60
 DEFAULT_HOTSEARCH_TOP_N = 10
@@ -50,7 +51,13 @@ CURRENT_SESSION_FAILURE_GUIDANCE = (
 )
 
 CONFIG_GROUPS = {
-    "account_settings": ("weibo_urls", "weibo_cookie", "cookie_notification_target"),
+    "account_settings": (
+        "weibo_urls",
+        "weibo_cookie",
+        "cookie_notification_target",
+        "auto_refresh_cookies",
+        "cookie_refresh_interval_hours",
+    ),
     "schedule_settings": (
         "check_interval",
         "check_interval_jitter",
@@ -122,8 +129,12 @@ class WeiboMonitor(Star):
             self.temp_images_dir.mkdir(parents=True, exist_ok=True)
         self.cookies_dir = self.data_dir / "cookies"
         self.cookies_dir.mkdir(parents=True, exist_ok=True)
-        self.cookie_file = WeiboCookieFile(self.cookies_dir / "weibo_cookie.txt")
+        self.cookie_file = WeiboCookieFile(self.cookies_dir / "weibo_cookies.txt")
+        self.legacy_cookie_file = WeiboCookieFile(
+            self.cookies_dir / "weibo_cookie.txt"
+        )
         self._cookie_refresh_lock = asyncio.Lock()
+        self._last_cookie_refresh_at = 0.0
 
         # 初始化日志
         self.plugin_logger = logging.getLogger("astrbot_plugin_weibo_monitor")
@@ -879,24 +890,44 @@ class WeiboMonitor(Star):
         return normalize_cookie_text(str(value)) if value is not None else ""
 
     def _initialize_cookie_value(self):
-        """配置优先；配置为空时从 Cookie 文件或旧备份恢复。"""
+        """优先使用已持久化的 Cookie，避免旧配置覆盖服务端续期值。"""
         configured_cookie = self._get_cookie_value()
         file_cookie = self.cookie_file.load()
+        if not file_cookie:
+            legacy_cookie = self.legacy_cookie_file.load()
+            if legacy_cookie:
+                file_cookie = legacy_cookie
+                if not self.cookie_file.save(legacy_cookie):
+                    self.plugin_logger.warning(
+                        "WeiboMonitor: 旧 Cookie 文件迁移到 weibo_cookies.txt 失败"
+                    )
+                else:
+                    self.plugin_logger.info(
+                        "WeiboMonitor: 已将旧 weibo_cookie.txt 迁移为 weibo_cookies.txt"
+                    )
         backup_cookie = normalize_cookie_text(self._data.get("_backup_weibo_cookie", ""))
 
+        # Cookie 响应可能已经把新值写入文件，而框架配置仍保留旧值；
+        # 重载时必须优先恢复文件，否则刚续期的登录态会被旧配置覆盖。
+        if file_cookie:
+            if configured_cookie and configured_cookie != file_cookie:
+                self.plugin_logger.info(
+                    "WeiboMonitor: 检测到 Cookie 文件存在更新值，优先使用持久化文件"
+                )
+            self._set_config("weibo_cookie", file_cookie)
+            if self._data.get("_backup_weibo_cookie") != file_cookie:
+                self._data["_backup_weibo_cookie"] = file_cookie
+                self._save_data()
+            self.plugin_logger.info(
+                "WeiboMonitor: 已从 cookies/weibo_cookies.txt 加载微博 Cookie"
+            )
+            return
         if configured_cookie:
             self._set_config("weibo_cookie", configured_cookie)
             if not self.cookie_file.save(configured_cookie):
                 self.plugin_logger.warning(
-                    "WeiboMonitor: 无法写入 cookies/weibo_cookie.txt，请检查插件数据目录权限"
+                    "WeiboMonitor: 无法写入 cookies/weibo_cookies.txt，请检查插件数据目录权限"
                 )
-            return
-        if file_cookie:
-            self._set_config("weibo_cookie", file_cookie)
-            self._data["_backup_weibo_cookie"] = file_cookie
-            self.plugin_logger.info(
-                "WeiboMonitor: 已从 cookies/weibo_cookie.txt 加载微博 Cookie"
-            )
             return
         if backup_cookie:
             self._set_config("weibo_cookie", backup_cookie)
@@ -916,16 +947,22 @@ class WeiboMonitor(Star):
             return
 
         async with self._cookie_refresh_lock:
+            response_url = getattr(response, "url", None)
+            request = getattr(response, "request", None)
+            request_url = getattr(request, "url", None)
+            response_host = getattr(response_url, "host", "") or getattr(
+                request_url, "host", ""
+            )
             refreshed_cookie, accepted, changed = merge_set_cookie_headers(
                 self._get_cookie_value(),
                 set_cookie_headers,
-                response.request.url.host or "",
+                response_host,
             )
             if not accepted or not refreshed_cookie or not changed:
                 return
             if not self.cookie_file.save(refreshed_cookie):
                 self.plugin_logger.warning(
-                    "WeiboMonitor: 微博下发了 Cookie 更新，但 weibo_cookie.txt 写入失败"
+                    "WeiboMonitor: 微博下发了 Cookie 更新，但 weibo_cookies.txt 写入失败"
                 )
                 return
             self._set_config("weibo_cookie", refreshed_cookie)
@@ -942,6 +979,48 @@ class WeiboMonitor(Star):
                 self.plugin_logger.info(
                     "WeiboMonitor: 已接收微博下发的新 Cookie 并同步到本地文件"
                 )
+
+    async def _refresh_weibo_cookie_session(self):
+        """定期访问微博网页，给服务端机会下发真实的续期 Cookie。"""
+        if not self._get_config("auto_refresh_cookies", True):
+            return
+        cookie = self._get_cookie_value()
+        if not cookie:
+            return
+
+        try:
+            interval_hours = float(
+                self._get_config("cookie_refresh_interval_hours", 12)
+            )
+        except (TypeError, ValueError):
+            interval_hours = 12
+        interval_seconds = max(1.0, min(168.0, interval_hours) * 3600)
+        now = asyncio.get_running_loop().time()
+        if now - self._last_cookie_refresh_at < interval_seconds:
+            return
+        self._last_cookie_refresh_at = now
+
+        headers = self.get_headers()
+        headers["Accept"] = (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        )
+        headers["Referer"] = f"{WEIBO_WEB_BASE}/"
+        try:
+            async with self._request_semaphore:
+                response = await self.client.get(
+                    WEIBO_COOKIE_REFRESH_URL,
+                    headers=headers,
+                )
+            self.plugin_logger.debug(
+                "WeiboMonitor: Cookie 保活请求完成，状态码 %s",
+                response.status_code,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self.plugin_logger.debug(
+                f"WeiboMonitor: Cookie 保活请求失败（不影响当前监控）: {error}"
+            )
 
     @staticmethod
     def _cookie_fingerprint(cookie: str) -> str:
@@ -2678,7 +2757,7 @@ class WeiboMonitor(Star):
             if cookie_explicitly_imported and imported_cookie:
                 if not self.cookie_file.save(imported_cookie):
                     self.plugin_logger.warning(
-                        "WeiboMonitor: 配置已导入，但 cookies/weibo_cookie.txt 写入失败"
+                        "WeiboMonitor: 配置已导入，但 cookies/weibo_cookies.txt 写入失败"
                     )
 
             # 只有全部持久化完成后才应用日志配置等运行时副作用。
@@ -2804,7 +2883,7 @@ class WeiboMonitor(Star):
                 "⚠️ 主配置已持久化，但插件兜底备份保存失败；请检查插件数据目录权限"
             )
         if not cookie_file_saved:
-            persistence_message += "；⚠️ cookies/weibo_cookie.txt 写入失败"
+            persistence_message += "；⚠️ cookies/weibo_cookies.txt 写入失败"
 
         yield event.plain_result(
             f"🔄 Cookie 已可靠保存，正在验证有效性...\n{persistence_message}"
@@ -3502,6 +3581,13 @@ class WeiboMonitor(Star):
                 except Exception as reminder_error:
                     self.plugin_logger.warning(
                         f"WeiboMonitor: 发送配置缺口提醒失败: {reminder_error}"
+                    )
+
+                try:
+                    await self._refresh_weibo_cookie_session()
+                except Exception as cookie_refresh_error:
+                    self.plugin_logger.debug(
+                        f"WeiboMonitor: Cookie 保活任务失败: {cookie_refresh_error}"
                     )
 
                 retention = self._get_config("temp_media_retention_minutes", 10)

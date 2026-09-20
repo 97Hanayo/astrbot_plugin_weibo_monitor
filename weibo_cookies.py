@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 from email.utils import parsedate_to_datetime
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -142,7 +143,7 @@ def merge_set_cookie_headers(
 
 
 class WeiboCookieFile:
-    """管理插件数据目录下的 cookies/weibo_cookie.txt。"""
+    """管理插件数据目录下的 cookies/weibo_cookies.txt。"""
 
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -157,15 +158,29 @@ class WeiboCookieFile:
         normalized = normalize_cookie_text(cookie_text)
         if not normalized:
             return False
+        temporary_path = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-            temporary.write_text(normalized + "\n", encoding="utf-8")
-            os.replace(temporary, self.path)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.path.parent,
+                prefix=f".{self.path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary:
+                temporary.write(normalized + "\n")
+                temporary_path = Path(temporary.name)
+            os.replace(temporary_path, self.path)
             try:
                 os.chmod(self.path, 0o600)
             except OSError:
                 pass
             return True
         except OSError:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             return False
