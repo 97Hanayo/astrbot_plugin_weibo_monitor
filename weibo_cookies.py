@@ -142,6 +142,25 @@ def merge_set_cookie_headers(
     return serialize_cookie_header(cookies), accepted, changed
 
 
+def would_remove_login_cookie(current_header: str, updated_header: str) -> bool:
+    """判断一次服务端更新是否会清空现有登录凭据。
+
+    微博在返回 login=false 时可能同时下发删除 Cookie。保留原值比把仍可
+    诊断或重新验证的 Cookie 直接覆盖成残缺值更安全。
+    """
+    current = parse_cookie_text(current_header)
+    updated = parse_cookie_text(updated_header)
+    if current.get("SUB") and current.get("SUBP"):
+        return not (updated.get("SUB") and updated.get("SUBP"))
+    if current.get("SUB"):
+        return not updated.get("SUB")
+    if current.get("SUBP"):
+        return not updated.get("SUBP")
+    if current.get("WBPSESS"):
+        return not updated.get("WBPSESS")
+    return False
+
+
 class WeiboCookieFile:
     """管理插件数据目录下的 cookies/weibo_cookies.txt。"""
 

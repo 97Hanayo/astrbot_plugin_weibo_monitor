@@ -22,6 +22,7 @@ from .weibo_cookies import (
     WeiboCookieFile,
     merge_set_cookie_headers,
     normalize_cookie_text,
+    would_remove_login_cookie,
 )
 
 # 常量定义
@@ -953,12 +954,18 @@ class WeiboMonitor(Star):
             response_host = getattr(response_url, "host", "") or getattr(
                 request_url, "host", ""
             )
+            current_cookie = self._get_cookie_value()
             refreshed_cookie, accepted, changed = merge_set_cookie_headers(
-                self._get_cookie_value(),
+                current_cookie,
                 set_cookie_headers,
                 response_host,
             )
             if not accepted or not refreshed_cookie or not changed:
+                return
+            if would_remove_login_cookie(current_cookie, refreshed_cookie):
+                self.plugin_logger.warning(
+                    "WeiboMonitor: 忽略会清空登录凭据的 Set-Cookie 更新，保留现有 Cookie"
+                )
                 return
             if not self.cookie_file.save(refreshed_cookie):
                 self.plugin_logger.warning(
