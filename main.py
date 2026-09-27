@@ -36,7 +36,9 @@ DEFAULT_MESSAGE_TEMPLATE = "🔔 {name} 发微博啦！\n\n{weibo}\n\n链接: {l
 WEIBO_API_BASE = "https://m.weibo.cn/api/container/getIndex"
 WEIBO_MOBILE_BASE = "https://m.weibo.cn"
 WEIBO_WEB_BASE = "https://weibo.com"
-WEIBO_COOKIE_REFRESH_URL = f"{WEIBO_WEB_BASE}/"
+# /api/config is the authenticated mobile endpoint used by the health check.
+# It rotates mobile-session cookies when the current Cookie is valid.
+WEIBO_COOKIE_REFRESH_URL = f"{WEIBO_MOBILE_BASE}/api/config"
 HOTSEARCH_API_URL = "https://weibo.com/ajax/side/hotSearch"
 DEFAULT_HOTSEARCH_INTERVAL = 60
 DEFAULT_HOTSEARCH_TOP_N = 10
@@ -988,7 +990,7 @@ class WeiboMonitor(Star):
                 )
 
     async def _refresh_weibo_cookie_session(self):
-        """定期访问微博网页，给服务端机会下发真实的续期 Cookie。"""
+        """定期访问移动端登录接口，持久化服务端真实下发的 Cookie。"""
         if not self._get_config("auto_refresh_cookies", True):
             return
         cookie = self._get_cookie_value()
@@ -1008,19 +1010,30 @@ class WeiboMonitor(Star):
         self._last_cookie_refresh_at = now
 
         headers = self.get_headers()
-        headers["Accept"] = (
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-        )
-        headers["Referer"] = f"{WEIBO_WEB_BASE}/"
+        headers["Accept"] = "application/json, text/plain, */*"
+        headers["Referer"] = f"{WEIBO_MOBILE_BASE}/"
         try:
             async with self._request_semaphore:
                 response = await self.client.get(
                     WEIBO_COOKIE_REFRESH_URL,
                     headers=headers,
                 )
+            login_state = "unknown"
+            if response.status_code == 200:
+                try:
+                    response_data = response.json()
+                    login = (response_data.get("data") or {}).get("login")
+                    if login is True:
+                        login_state = "true"
+                    elif login is False:
+                        login_state = "false"
+                except (TypeError, ValueError):
+                    pass
             self.plugin_logger.debug(
-                "WeiboMonitor: Cookie 保活请求完成，状态码 %s",
+                "WeiboMonitor: Cookie 保活请求完成，状态码 %s，login=%s；"
+                "仅持久化响应 Set-Cookie，不使用 user_token",
                 response.status_code,
+                login_state,
             )
         except asyncio.CancelledError:
             raise
