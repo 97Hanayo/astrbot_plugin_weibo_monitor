@@ -11,6 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+from urllib.parse import urlparse
 
 try:
     from astrbot.api import logger
@@ -158,16 +159,27 @@ async def collect_browser_cookies(
                 },
             )
             try:
-                seed_cookies = [
-                    {
-                        "name": name,
-                        "value": value,
-                        "url": refresh_url,
-                    }
-                    for refresh_url in refresh_urls
-                    for name, value in cookies.items()
-                    if name and value
-                ]
+                seed_cookies = []
+                for refresh_url in refresh_urls:
+                    host = (urlparse(refresh_url).hostname or "").lower()
+                    if not host:
+                        continue
+                    root_domain = (
+                        ".weibo.cn"
+                        if host == "weibo.cn" or host.endswith(".weibo.cn")
+                        else ".weibo.com"
+                    )
+                    seed_cookies.extend(
+                        {
+                            "name": name,
+                            "value": value,
+                            "domain": root_domain,
+                            "path": "/",
+                            "secure": True,
+                        }
+                        for name, value in cookies.items()
+                        if name and value
+                    )
                 if seed_cookies:
                     await context.add_cookies(seed_cookies)
 

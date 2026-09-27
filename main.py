@@ -991,6 +991,8 @@ class WeiboMonitor(Star):
 
     async def _capture_weibo_cookie_updates(self, response: httpx.Response):
         """接收微博 Set-Cookie 并回写本地文件，尽可能延续服务端会话。"""
+        if not self._get_config("auto_refresh_cookies", True):
+            return
         if not response.request.headers.get("Cookie"):
             return
         set_cookie_headers = response.headers.get_list("set-cookie")
@@ -1012,6 +1014,7 @@ class WeiboMonitor(Star):
                 set_cookie_headers,
                 response_host,
                 allowed_domains=("weibo.cn",),
+                protected_names=WEIBO_LOGIN_COOKIE_NAMES,
             )
             if not accepted or not refreshed_cookie or not changed:
                 return
@@ -1055,29 +1058,13 @@ class WeiboMonitor(Star):
                     for character in (*name, *value)
                 ):
                     continue
+                if name in WEIBO_LOGIN_COOKIE_NAMES:
+                    continue
                 if name not in priorities or priority <= priorities[name]:
                     updates[name] = value
                     priorities[name] = priority
 
             if not updates:
-                return
-            if any(
-                current.get(name) and not updates.get(name)
-                for name in WEIBO_LOGIN_COOKIE_NAMES
-            ):
-                self.plugin_logger.warning(
-                    "WeiboMonitor: Playwright Cookie 未保留关键登录 Cookie，忽略本次覆盖"
-                )
-                return
-            if any(
-                current.get(name)
-                and updates.get(name)
-                and current[name] != updates[name]
-                for name in ("SUB", "SUBP")
-            ):
-                self.plugin_logger.warning(
-                    "WeiboMonitor: Playwright Cookie 替换了 SUB/SUBP，忽略本次覆盖"
-                )
                 return
 
             merged = dict(current)

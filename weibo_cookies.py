@@ -131,12 +131,14 @@ def merge_set_cookie_headers(
     set_cookie_headers: Iterable[str],
     response_host: str,
     allowed_domains: Iterable[str] | None = None,
+    protected_names: Iterable[str] | None = None,
 ) -> Tuple[str, bool, bool]:
     """合并微博响应 Cookie，返回 (新请求头, 是否收到, 是否变更)。"""
     allowed = tuple(
         str(domain).strip().lower().rstrip(".").lstrip(".")
         for domain in (allowed_domains or ())
     )
+    protected = {str(name).strip() for name in (protected_names or ()) if name}
 
     def domain_is_allowed(domain: str) -> bool:
         if not is_weibo_domain(domain):
@@ -165,6 +167,10 @@ def merge_set_cookie_headers(
                 or not domain_is_allowed(domain)
                 or not _is_safe_cookie_value(morsel.value)
             ):
+                continue
+            # 登录凭据只能由用户显式替换。微博的某些页面/API 会为当前
+            # 响应下发另一套同名值，自动合并会把刚验证成功的会话覆盖掉。
+            if name in protected:
                 continue
             accepted = True
             if _is_deletion(morsel):

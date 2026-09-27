@@ -323,6 +323,7 @@ group_fans_C: 2534531481, 5310078607, https://weibo.com/n/某明星
 - Cookie具有有效期，失效后需要重新获取
 - `weibo_cookies.txt` 支持浏览器导出的 Netscape 格式和 `name=value; ...` 请求头格式；Netscape 文件只采用 `weibo.cn` / `m.weibo.cn` 域记录。请求头请从 `m.weibo.cn` 获取，`weibo.com` 桌面端的同名 Cookie 可能对应不同会话
 - 插件默认每 12 小时用 Playwright 加载微博移动端页面，读取 `weibo.cn` 域的 Cookie 并原子回写文件；桌面端 `weibo.com` 的 Cookie 不会覆盖移动端会话。Playwright 不可用时降级请求移动端 `/api/config`，可在“微博账号与认证”中关闭或调整间隔
+- 自动保活只合并辅助 Cookie，不会替换 `SUB`、`SUBP`、`WBPSESS` 等登录凭据；登录凭据只会在手动更新配置或执行 `/weibo_cookie` 时改变
 - 服务端若不续期或主动使登录失效，仍需重新获取 Cookie
 - 请勿在多设备同时登录同一账号，可能导致Cookie失效
 - 建议在浏览器开发者工具中复制 `m.weibo.cn` 请求的 Cookie；从 resolver 或 `weibo.com` 复制的桌面端 Cookie 不保证适用于移动端接口

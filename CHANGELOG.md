@@ -3,6 +3,7 @@
 ## 未发布
 
 - **微博 Cookie 域隔离**：仅从 `m.weibo.cn` 刷新会话并保存 `weibo.cn` 移动端 Cookie；忽略桌面端 `weibo.com` 的同名 Cookie，避免覆盖后导致移动端登录态失效。
+- **登录凭据保护**：自动保活不再改写 `SUB`、`SUBP`、`WBPSESS`；这些登录 Cookie 仅在用户更新配置或执行 `/weibo_cookie` 时替换，避免监控接口下发的同名值覆盖刚验证成功的会话。
 - **Cookie 持久化修复**：插件重载时优先使用 `cookies/weibo_cookies.txt` 中的已续期 Cookie，避免旧配置覆盖服务端更新值。
 - **Cookie 保活**：默认每 12 小时用 Playwright 加载微博移动端页面，读取最终 Cookie 状态并原子写回本地文件；Playwright 不可用时降级到移动端 `/api/config`。
 - **文件名兼容**：统一识别 `cookies/weibo_cookies.txt`，首次启动时自动迁移旧的 `weibo_cookie.txt`。
