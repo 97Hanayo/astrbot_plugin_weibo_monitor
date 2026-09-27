@@ -3,7 +3,7 @@
 ## 未发布
 
 - **Cookie 持久化修复**：插件重载时优先使用 `cookies/weibo_cookies.txt` 中的已续期 Cookie，避免旧配置覆盖服务端更新值。
-- **Cookie 保活**：默认每 12 小时请求一次移动端 `/api/config`，捕获真实 `Set-Cookie` 并原子写回本地文件；新增可配置的开关和间隔。
+- **Cookie 保活**：默认每 12 小时用 Playwright 加载微博桌面端和移动端页面，读取最终 Cookie 状态并原子写回本地文件；Playwright 不可用时降级到移动端 `/api/config`。
 - **文件名兼容**：统一识别 `cookies/weibo_cookies.txt`，首次启动时自动迁移旧的 `weibo_cookie.txt`。
 - **校验保护**：微博返回 `login: false` 并尝试删除登录 Cookie 时，不再把残缺 Cookie 持久化覆盖原值。
 
