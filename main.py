@@ -1118,6 +1118,7 @@ class WeiboMonitor(Star):
                 user_agent=headers.get("User-Agent", ""),
                 timeout_ms=DEFAULT_TIMEOUT * 1000,
                 browser_path=self.data_dir / "playwright-browsers",
+                login_check_url=WEIBO_COOKIE_REFRESH_URL,
             )
             if not browser_cookies:
                 raise RuntimeError("Playwright 未返回微博 Cookie")
