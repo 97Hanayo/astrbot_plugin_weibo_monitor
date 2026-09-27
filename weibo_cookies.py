@@ -23,6 +23,15 @@ def is_weibo_domain(value: str) -> bool:
     )
 
 
+def is_mobile_weibo_domain(value: str) -> bool:
+    """判断域名是否属于 m.weibo.cn 使用的移动端 Cookie 域。"""
+    domain = str(value or "").strip().lower().rstrip(".").lstrip(".")
+    return (
+        domain in {"weibo.cn", "m.weibo.cn"}
+        or domain.endswith(".m.weibo.cn")
+    )
+
+
 def _is_safe_cookie_value(value: str) -> bool:
     return not any(
         character.isspace() or ord(character) < 32 or ord(character) == 127
@@ -37,6 +46,7 @@ def parse_cookie_text(text: str) -> Dict[str, str]:
         return {}
 
     netscape_cookies: Dict[str, str] = {}
+    netscape_priorities: Dict[str, int] = {}
     for original_line in raw_text.splitlines():
         line = original_line.strip()
         if line.startswith("#HttpOnly_"):
@@ -51,12 +61,21 @@ def parse_cookie_text(text: str) -> Dict[str, str]:
         domain, _subdomains, _path, _secure, _expires, name, value = fields
         name = name.strip()
         value = value.strip()
+        normalized_domain = domain.strip().lower().rstrip(".").lstrip(".")
         if (
-            is_weibo_domain(domain)
+            is_mobile_weibo_domain(normalized_domain)
             and COOKIE_NAME_RE.fullmatch(name)
             and _is_safe_cookie_value(value)
         ):
-            netscape_cookies[name] = value
+            # A flat Cookie header cannot retain domain scope. For duplicate
+            # names, keep the value scoped directly to m.weibo.cn when present.
+            priority = 0 if normalized_domain == "m.weibo.cn" else 1
+            if (
+                name not in netscape_priorities
+                or priority <= netscape_priorities[name]
+            ):
+                netscape_cookies[name] = value
+                netscape_priorities[name] = priority
 
     # 避免把 Netscape 文件整行再次误当成 HTTP 请求头。
     if netscape_cookies:
@@ -108,10 +127,27 @@ def _is_deletion(morsel) -> bool:
 
 
 def merge_set_cookie_headers(
-    current_header: str, set_cookie_headers: Iterable[str], response_host: str
+    current_header: str,
+    set_cookie_headers: Iterable[str],
+    response_host: str,
+    allowed_domains: Iterable[str] | None = None,
 ) -> Tuple[str, bool, bool]:
     """合并微博响应 Cookie，返回 (新请求头, 是否收到, 是否变更)。"""
-    if not is_weibo_domain(response_host):
+    allowed = tuple(
+        str(domain).strip().lower().rstrip(".").lstrip(".")
+        for domain in (allowed_domains or ())
+    )
+
+    def domain_is_allowed(domain: str) -> bool:
+        if not is_weibo_domain(domain):
+            return False
+        normalized = str(domain or "").strip().lower().rstrip(".").lstrip(".")
+        return not allowed or any(
+            normalized == root or normalized.endswith(f".{root}")
+            for root in allowed
+        )
+
+    if not domain_is_allowed(response_host):
         return normalize_cookie_text(current_header), False, False
     cookies = parse_cookie_text(current_header)
     accepted = False
@@ -126,7 +162,7 @@ def merge_set_cookie_headers(
             domain = str(morsel["domain"] or response_host)
             if (
                 not COOKIE_NAME_RE.fullmatch(name)
-                or not is_weibo_domain(domain)
+                or not domain_is_allowed(domain)
                 or not _is_safe_cookie_value(morsel.value)
             ):
                 continue

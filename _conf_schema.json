@@ -13,8 +13,8 @@
     "hint": "配置需要监控的微博账号和访问凭据。注意：导出、导入和 Cookie 命令所需的管理员 ID 必须在 AstrBot 全局 admins_id/“管理员 ID”中配置，不在本插件中配置。",
     "items": {
       "weibo_urls": {"type": "list", "item_type": "string", "default": [], "invisible": true},
-      "weibo_cookie": {"type": "string", "default": "", "description": "微博 Cookie", "hint": "支持 Cookie 请求头或 Netscape cookies.txt 内容，也可留空后使用插件数据目录 cookies/weibo_cookies.txt；接受 weibo.com 与 weibo.cn Cookie。填写后还需在“订阅分组管理”中添加接收会话。", "obvious_hint": true},
-      "auto_refresh_cookies": {"type": "bool", "default": true, "description": "自动续期微博 Cookie", "hint": "定期用 Playwright 加载微博桌面端和移动端页面并保存最终 Cookie；不可用时降级请求移动端 /api/config，不会伪造 Cookie 有效期，也不依赖 user_token。"},
+      "weibo_cookie": {"type": "string", "default": "", "description": "微博移动端 Cookie", "hint": "请使用从 m.weibo.cn 获取的 Cookie 请求头，或包含 weibo.cn 记录的 Netscape cookies.txt；weibo.com 桌面端 Cookie 与移动端会话不同。也可留空后读取插件数据目录 cookies/weibo_cookies.txt。填写后还需在“订阅分组管理”中添加接收会话。", "obvious_hint": true},
+      "auto_refresh_cookies": {"type": "bool", "default": true, "description": "自动续期微博 Cookie", "hint": "定期用 Playwright 加载微博移动端页面并保存 weibo.cn 域 Cookie；不会用桌面端 weibo.com 的同名 Cookie 覆盖移动端会话。不可用时降级请求移动端 /api/config，不会伪造 Cookie 有效期，也不依赖 user_token。"},
       "cookie_refresh_interval_hours": {"type": "int", "default": 12, "min": 1, "max": 168, "description": "Cookie 保活间隔（小时）", "hint": "登录 Cookie 保活请求的最短间隔，建议 6~24 小时。"},
       "cookie_notification_target": {"type": "string", "default": "", "description": "管理与配置提醒目标", "hint": "可选。请在目标群聊或私聊执行 /weibo_umo，并填写命令返回的完整会话 ID；不要填写平台原始群号或用户号。用于 Cookie 未配置、Cookie 失效或尚未配置订阅分组等管理提醒。"}
     }

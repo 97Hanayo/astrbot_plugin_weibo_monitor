@@ -21,6 +21,7 @@ import astrbot.api.message_components as Comp
 from .weibo_cookies import (
     WeiboCookieFile,
     merge_set_cookie_headers,
+    is_mobile_weibo_domain,
     normalize_cookie_text,
     parse_cookie_text,
     serialize_cookie_header,
@@ -40,9 +41,10 @@ WEIBO_API_BASE = "https://m.weibo.cn/api/container/getIndex"
 WEIBO_MOBILE_BASE = "https://m.weibo.cn"
 WEIBO_WEB_BASE = "https://weibo.com"
 # /api/config is the authenticated mobile endpoint used by the health check.
-# It rotates mobile-session cookies when the current Cookie is valid.
+# Keep this plugin's refresh jar on weibo.cn; desktop cookies can have different
+# values under the same names and must not replace mobile-session cookies.
 WEIBO_COOKIE_REFRESH_URL = f"{WEIBO_MOBILE_BASE}/api/config"
-WEIBO_BROWSER_REFRESH_URLS = (f"{WEIBO_WEB_BASE}/", f"{WEIBO_MOBILE_BASE}/")
+WEIBO_BROWSER_REFRESH_URLS = (f"{WEIBO_MOBILE_BASE}/",)
 WEIBO_LOGIN_COOKIE_NAMES = ("SUB", "SUBP", "WBPSESS")
 HOTSEARCH_API_URL = "https://weibo.com/ajax/side/hotSearch"
 DEFAULT_HOTSEARCH_INTERVAL = 60
@@ -1002,11 +1004,14 @@ class WeiboMonitor(Star):
             response_host = getattr(response_url, "host", "") or getattr(
                 request_url, "host", ""
             )
+            if not is_mobile_weibo_domain(response_host):
+                return
             current_cookie = self._get_cookie_value()
             refreshed_cookie, accepted, changed = merge_set_cookie_headers(
                 current_cookie,
                 set_cookie_headers,
                 response_host,
+                allowed_domains=("weibo.cn",),
             )
             if not accepted or not refreshed_cookie or not changed:
                 return
@@ -1029,15 +1034,17 @@ class WeiboMonitor(Star):
             updates: Dict[str, str] = {}
             priorities: Dict[str, int] = {}
             for browser_cookie in browser_cookies:
-                domain = str(browser_cookie.get("domain") or "").lower().lstrip(".")
+                domain = (
+                    str(browser_cookie.get("domain") or "")
+                    .lower()
+                    .rstrip(".")
+                    .lstrip(".")
+                )
                 if domain in {"passport.weibo.com", "passport.weibo.cn"}:
                     continue
-                if domain == "weibo.com" or domain.endswith(".weibo.com"):
-                    priority = 0
-                elif domain == "weibo.cn" or domain.endswith(".weibo.cn"):
-                    priority = 1
-                else:
+                if not is_mobile_weibo_domain(domain):
                     continue
+                priority = 0 if domain == "m.weibo.cn" else 1
 
                 name = str(browser_cookie.get("name") or "").strip()
                 value = str(browser_cookie.get("value") or "").strip()
@@ -1048,7 +1055,7 @@ class WeiboMonitor(Star):
                     for character in (*name, *value)
                 ):
                     continue
-                if name not in priorities or priority < priorities[name]:
+                if name not in priorities or priority <= priorities[name]:
                     updates[name] = value
                     priorities[name] = priority
 
@@ -1107,7 +1114,7 @@ class WeiboMonitor(Star):
             browser_cookies = await collect_browser_cookies(
                 cookies=parse_cookie_text(cookie),
                 refresh_urls=WEIBO_BROWSER_REFRESH_URLS,
-                allowed_domains=("weibo.com", "weibo.cn"),
+                allowed_domains=("weibo.cn",),
                 user_agent=headers.get("User-Agent", ""),
                 timeout_ms=DEFAULT_TIMEOUT * 1000,
                 browser_path=self.data_dir / "playwright-browsers",
