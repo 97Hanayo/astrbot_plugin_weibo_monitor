@@ -29,7 +29,9 @@ from .weibo_cookies import (
     would_remove_login_cookie,
 )
 from .weibo_playwright import collect_browser_cookies
-from .weibo_session import CookieValidationError, login_uid, validate_mobile_cookie
+from .weibo_session import (
+    CookieValidationError, LOGIN_COOKIE_NAMES, login_uid, validate_mobile_cookie,
+)
 
 # 常量定义
 DEFAULT_CHECK_INTERVAL = 10  # 默认检查间隔（分钟）
@@ -47,7 +49,7 @@ WEIBO_WEB_BASE = "https://weibo.com"
 # values under the same names and must not replace mobile-session cookies.
 WEIBO_COOKIE_REFRESH_URL = f"{WEIBO_MOBILE_BASE}/api/config"
 WEIBO_BROWSER_REFRESH_URLS = (f"{WEIBO_MOBILE_BASE}/",)
-WEIBO_LOGIN_COOKIE_NAMES = ("SUB", "SUBP", "WBPSESS")
+WEIBO_LOGIN_COOKIE_NAMES = LOGIN_COOKIE_NAMES
 HOTSEARCH_API_URL = "https://weibo.com/ajax/side/hotSearch"
 DEFAULT_HOTSEARCH_INTERVAL = 60
 DEFAULT_HOTSEARCH_TOP_N = 10

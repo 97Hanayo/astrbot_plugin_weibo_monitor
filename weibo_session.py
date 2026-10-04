@@ -3,8 +3,11 @@
 from .weibo_cookies import (
     merge_set_cookie_headers,
     normalize_cookie_text,
+    parse_cookie_text,
     would_remove_login_cookie,
 )
+
+LOGIN_COOKIE_NAMES = ("SUB", "SUBP", "WBPSESS")
 
 
 class CookieValidationError(ValueError):
@@ -25,8 +28,9 @@ def login_uid(payload):
 async def validate_mobile_cookie(client, cookie, headers, expected_uid=None):
     """Return (UID, verified header); reject logout, account switches or churn.
 
-    The client must have no response hooks. Every returned header has itself
-    passed /api/config, including rotations received during validation.
+    The client must have no response hooks. Return a header that was actually
+    sent and confirmed logged in. Recheck changed login credentials, but do not
+    demand convergence of auxiliary cookies that may change on every request.
     """
     candidate = normalize_cookie_text(cookie)
     if not candidate:
@@ -55,7 +59,17 @@ async def validate_mobile_cookie(client, cookie, headers, expected_uid=None):
         )
         if would_remove_login_cookie(candidate, updated):
             raise CookieValidationError("验证响应删除了登录凭据")
-        if not changed:
+        before = parse_cookie_text(candidate)
+        after = parse_cookie_text(updated)
+        changed_login_names = [
+            name for name in LOGIN_COOKIE_NAMES if before.get(name) != after.get(name)
+        ]
+        if not changed or not changed_login_names:
+            # Return the verified request, not the response's unverified jar.
+            # Reapplying rotating auxiliary values here would cause an endless
+            # validation loop even when every response confirms the same login.
             return uid, candidate
         candidate = updated
-    raise CookieValidationError("验证期间 Cookie 持续变化，暂不保存")
+    raise CookieValidationError(
+        "验证期间登录凭据持续变化（" + ",".join(changed_login_names) + "），暂不保存"
+    )
