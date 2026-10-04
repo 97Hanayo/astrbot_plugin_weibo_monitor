@@ -42,9 +42,10 @@ async def validate_mobile_cookie(client, cookie, headers, expected_uid=None):
         if response.status_code != 200:
             raise CookieValidationError(f"验证状态码 {response.status_code}")
         try:
-            uid = login_uid(response.json())
+            payload = response.json()
         except (TypeError, ValueError) as exc:
-            raise CookieValidationError("验证响应未确认登录账号") from exc
+            raise CookieValidationError("验证响应不是有效 JSON") from exc
+        uid = login_uid(payload)
         if identity is not None and uid != identity:
             raise CookieValidationError("候选 Cookie 的账号不一致")
         identity = uid

@@ -55,7 +55,7 @@
    机器人会返回当前会话的 ID，请记录下来。
 
 4. **配置插件**：
-   在 AstrBot 管理面板 -> 插件设置 -> `weibo_monitor` 中，按卡片配置 Cookie、监控频率、微博推送内容、图片与视频等项目。也可将 Cookie 保存到插件数据目录的 `cookies/weibo_cookies.txt`；插件重载时会优先使用该文件中已更新的 Cookie，避免旧配置覆盖服务端续期值。
+   在 AstrBot 管理面板 -> 插件设置 -> `weibo_monitor` 中，按卡片配置 Cookie、监控频率、微博推送内容、图片与视频等项目。也可将 Cookie 保存到插件数据目录的 `cookies/weibo_cookies.txt`。后台手动更新的 Cookie 会同步到该文件；后台配置未变时，重载会保留文件中已续期的 Cookie。
 
 5. **配置监控与推送目标**：
    打开本插件详情页的 **订阅分组管理** Page：
