@@ -162,9 +162,15 @@ def merge_set_cookie_headers(
             continue
         for name, morsel in parsed.items():
             domain = str(morsel["domain"] or response_host)
+            normalized_domain = domain.strip().lower().lstrip(".").rstrip(".")
+            normalized_host = str(response_host).lower().rstrip(".")
             if (
                 not COOKIE_NAME_RE.fullmatch(name)
                 or not domain_is_allowed(domain)
+                or not (
+                    normalized_host == normalized_domain
+                    or normalized_host.endswith(f".{normalized_domain}")
+                )
                 or not _is_safe_cookie_value(morsel.value)
             ):
                 continue

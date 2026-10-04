@@ -13,6 +13,7 @@ from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple, Dict, Any
 from urllib.parse import quote
+from astrbot.api import logger as astrbot_logger
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api.web import error_response, json_response, request
@@ -28,6 +29,7 @@ from .weibo_cookies import (
     would_remove_login_cookie,
 )
 from .weibo_playwright import collect_browser_cookies
+from .weibo_session import login_uid, validate_mobile_cookie
 
 # 常量定义
 DEFAULT_CHECK_INTERVAL = 10  # 默认检查间隔（分钟）
@@ -948,6 +950,22 @@ class WeiboMonitor(Star):
             "WeiboMonitor: 未配置微博 Cookie，微博动态自动监控将暂停；免 Cookie 热搜等独立功能不受此提示影响。"
         )
 
+    def _log_cookie_refresh(self, level: str, message: str, *args):
+        getattr(self.plugin_logger, level)(message, *args)
+        # The standalone file/stream logger is not captured by AstrBot's WebUI.
+        getattr(astrbot_logger, level)(message % args if args else message)
+
+    def _remember_cookie_identity(self, cookie: str, uid: str):
+        self._data["_cookie_verified_uid"] = str(uid)
+        self._data["_cookie_verified_fingerprint"] = self._cookie_fingerprint(cookie)
+
+    async def _validate_cookie_candidate(self, cookie: str, expected_uid=None):
+        # A separate client avoids recursive Set-Cookie hooks and shares no jar.
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+            return await validate_mobile_cookie(
+                client, cookie, self.get_headers(), expected_uid,
+            )
+
     async def _persist_refreshed_cookie(
         self,
         current_cookie: str,
@@ -956,29 +974,64 @@ class WeiboMonitor(Star):
     ) -> bool:
         """统一持久化 HTTP 或 Playwright 得到的有效 Cookie 更新。"""
         refreshed_cookie = normalize_cookie_text(refreshed_cookie)
-        if not refreshed_cookie or refreshed_cookie == normalize_cookie_text(current_cookie):
+        if not refreshed_cookie:
+            return False
+        if refreshed_cookie == normalize_cookie_text(current_cookie):
+            self._log_cookie_refresh(
+                "info", "WeiboMonitor: 保活未收到不同的 Cookie 值；此次访问不能证明登录凭据已续期",
+            )
             return False
         if would_remove_login_cookie(current_cookie, refreshed_cookie):
             self.plugin_logger.warning(
                 "WeiboMonitor: 忽略会清空登录凭据的 Cookie 更新，保留现有 Cookie"
             )
             return False
+        if normalize_cookie_text(current_cookie) != self._get_cookie_value():
+            self.plugin_logger.info("WeiboMonitor: Cookie 已被更新，丢弃旧会话的续期结果")
+            return False
+        try:
+            expected_uid = None
+            if self._data.get("_cookie_verified_fingerprint") == self._cookie_fingerprint(current_cookie):
+                expected_uid = self._data.get("_cookie_verified_uid")
+            if not expected_uid:
+                expected_uid, _ = await self._validate_cookie_candidate(current_cookie)
+            uid, refreshed_cookie = await self._validate_cookie_candidate(
+                refreshed_cookie, expected_uid,
+            )
+        except Exception as exc:
+            self._log_cookie_refresh(
+                "warning", "WeiboMonitor: Cookie 续期候选验证失败，保留原值（%s）", type(exc).__name__,
+            )
+            return False
+        if self._get_cookie_value() != normalize_cookie_text(current_cookie):
+            self.plugin_logger.info("WeiboMonitor: 验证期间 Cookie 已被更新，丢弃旧会话结果")
+            return False
+        previous = parse_cookie_text(current_cookie)
+        updated = parse_cookie_text(refreshed_cookie)
+        changed_names = sorted(
+            name for name in set(previous) | set(updated)
+            if previous.get(name) != updated.get(name)
+        )
         if not self.cookie_file.save(refreshed_cookie):
-            self.plugin_logger.warning(
-                "WeiboMonitor: %s后的 Cookie 写入 weibo_cookies.txt 失败",
+            self._log_cookie_refresh(
+                "warning", "WeiboMonitor: %s后的 Cookie 写入 weibo_cookies.txt 失败",
                 reason,
             )
             return False
 
         self._set_config("weibo_cookie", refreshed_cookie)
+        self._remember_cookie_identity(refreshed_cookie, uid)
         self._data["_backup_weibo_cookie"] = refreshed_cookie
         self._data["_cookie_fingerprint"] = self._cookie_fingerprint(
             refreshed_cookie
         )
         self._save_data()
+        self._log_cookie_refresh(
+            "info", "WeiboMonitor: Cookie 续期已验证同一账号并写入文件，更新字段=%s", ",".join(changed_names),
+        )
         if not await self._save_plugin_config_async(reason):
-            self.plugin_logger.warning(
-                "WeiboMonitor: %s后的 Cookie 已写入本地文件，但框架配置保存失败",
+            self._log_cookie_refresh(
+                "warning", "WeiboMonitor: %s后的 Cookie 已写入本地文件，但框架配置保存失败",
                 reason,
             )
             return True
@@ -995,10 +1048,6 @@ class WeiboMonitor(Star):
             return
         if not response.request.headers.get("Cookie"):
             return
-        set_cookie_headers = response.headers.get_list("set-cookie")
-        if not set_cookie_headers:
-            return
-
         async with self._cookie_refresh_lock:
             response_url = getattr(response, "url", None)
             request = getattr(response, "request", None)
@@ -1009,12 +1058,25 @@ class WeiboMonitor(Star):
             if not is_mobile_weibo_domain(response_host):
                 return
             current_cookie = self._get_cookie_value()
+            if normalize_cookie_text(response.request.headers.get("Cookie", "")) != current_cookie:
+                return
+            if getattr(response_url, "path", "") == "/api/config":
+                await response.aread()
+                if response.status_code != 200:
+                    return
+                try:
+                    uid = login_uid(response.json())
+                except (TypeError, ValueError):
+                    return
+                self._remember_cookie_identity(current_cookie, uid)
+            set_cookie_headers = response.headers.get_list("set-cookie")
+            if not set_cookie_headers:
+                return
             refreshed_cookie, accepted, changed = merge_set_cookie_headers(
                 current_cookie,
                 set_cookie_headers,
                 response_host,
                 allowed_domains=("weibo.cn",),
-                protected_names=WEIBO_LOGIN_COOKIE_NAMES,
             )
             if not accepted or not refreshed_cookie or not changed:
                 return
@@ -1025,7 +1087,7 @@ class WeiboMonitor(Star):
             )
 
     async def _capture_playwright_cookie_updates(
-        self, browser_cookies: List[Dict[str, Any]]
+        self, browser_cookies: List[Dict[str, Any]], source_cookie: Optional[str] = None
     ) -> None:
         """合并 Playwright 最终 Cookie jar，并保护现有登录态。"""
         if not browser_cookies:
@@ -1033,6 +1095,9 @@ class WeiboMonitor(Star):
 
         async with self._cookie_refresh_lock:
             current_cookie = self._get_cookie_value()
+            if source_cookie is not None and normalize_cookie_text(source_cookie) != current_cookie:
+                self.plugin_logger.info("WeiboMonitor: 浏览器使用的 Cookie 已被更新，丢弃本次结果")
+                return
             current = parse_cookie_text(current_cookie)
             updates: Dict[str, str] = {}
             priorities: Dict[str, int] = {}
@@ -1057,8 +1122,6 @@ class WeiboMonitor(Star):
                     or ord(character) == 127
                     for character in (*name, *value)
                 ):
-                    continue
-                if name in WEIBO_LOGIN_COOKIE_NAMES:
                     continue
                 if name not in priorities or priority <= priorities[name]:
                     updates[name] = value
@@ -1096,6 +1159,23 @@ class WeiboMonitor(Star):
             return
         self._last_cookie_refresh_at = now
 
+        self._log_cookie_refresh("info", "WeiboMonitor: 开始移动端 Cookie 保活与登录验证")
+        try:
+            uid, verified_cookie = await self._validate_cookie_candidate(cookie)
+        except Exception as exc:
+            self._log_cookie_refresh(
+                "warning", "WeiboMonitor: Cookie 保活未确认登录，保留原值；已失效会话需重新登录（%s）",
+                type(exc).__name__,
+            )
+            return
+        async with self._cookie_refresh_lock:
+            if cookie != self._get_cookie_value():
+                return
+            self._remember_cookie_identity(cookie, uid)
+            if verified_cookie != cookie:
+                await self._persist_refreshed_cookie(cookie, verified_cookie, "移动端登录验证续期")
+            cookie = self._get_cookie_value()
+
         headers = self.get_headers()
         try:
             browser_cookies = await collect_browser_cookies(
@@ -1109,18 +1189,18 @@ class WeiboMonitor(Star):
             )
             if not browser_cookies:
                 raise RuntimeError("Playwright 未返回微博 Cookie")
-            await self._capture_playwright_cookie_updates(browser_cookies)
-            self.plugin_logger.debug(
-                "WeiboMonitor: Playwright Cookie 保活完成，browser_cookies=%s",
+            await self._capture_playwright_cookie_updates(browser_cookies, cookie)
+            self._log_cookie_refresh(
+                "info", "WeiboMonitor: Playwright 保活登录验证完成；仅验证并保存服务端实际更新，Cookie 数=%s",
                 len(browser_cookies),
             )
             return
         except asyncio.CancelledError:
             raise
         except Exception as browser_error:
-            self.plugin_logger.debug(
-                "WeiboMonitor: Playwright Cookie 保活失败，降级到 HTTPX: %s",
-                browser_error,
+            self._log_cookie_refresh(
+                "info", "WeiboMonitor: Playwright 保活不可用，降级到 HTTPX（%s）",
+                type(browser_error).__name__,
             )
 
         headers["Accept"] = "application/json, text/plain, */*"
@@ -1142,8 +1222,8 @@ class WeiboMonitor(Star):
                         login_state = "false"
                 except (TypeError, ValueError):
                     pass
-            self.plugin_logger.debug(
-                "WeiboMonitor: HTTPX Cookie 保活请求完成，状态码 %s，login=%s；"
+            self._log_cookie_refresh(
+                "info", "WeiboMonitor: HTTPX Cookie 保活请求完成，状态码 %s，login=%s；"
                 "仅持久化响应 Set-Cookie，不使用 user_token",
                 response.status_code,
                 login_state,
@@ -1151,8 +1231,8 @@ class WeiboMonitor(Star):
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            self.plugin_logger.debug(
-                f"WeiboMonitor: Cookie 保活请求失败（不影响当前监控）: {error}"
+            self._log_cookie_refresh(
+                "warning", "WeiboMonitor: Cookie 保活请求失败，保留原值（%s）", type(error).__name__,
             )
 
     @staticmethod
