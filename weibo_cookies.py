@@ -23,13 +23,10 @@ def is_weibo_domain(value: str) -> bool:
     )
 
 
-def is_mobile_weibo_domain(value: str) -> bool:
-    """判断域名是否属于 m.weibo.cn 使用的移动端 Cookie 域。"""
+def is_desktop_weibo_domain(value: str) -> bool:
+    """只采用能够发给 weibo.com 的 Cookie，排除移动端和其他子域。"""
     domain = str(value or "").strip().lower().rstrip(".").lstrip(".")
-    return (
-        domain in {"weibo.cn", "m.weibo.cn"}
-        or domain.endswith(".m.weibo.cn")
-    )
+    return domain == "weibo.com"
 
 
 def _is_safe_cookie_value(value: str) -> bool:
@@ -46,7 +43,6 @@ def parse_cookie_text(text: str) -> Dict[str, str]:
         return {}
 
     netscape_cookies: Dict[str, str] = {}
-    netscape_priorities: Dict[str, int] = {}
     for original_line in raw_text.splitlines():
         line = original_line.strip()
         if line.startswith("#HttpOnly_"):
@@ -63,19 +59,11 @@ def parse_cookie_text(text: str) -> Dict[str, str]:
         value = value.strip()
         normalized_domain = domain.strip().lower().rstrip(".").lstrip(".")
         if (
-            is_mobile_weibo_domain(normalized_domain)
+            is_desktop_weibo_domain(normalized_domain)
             and COOKIE_NAME_RE.fullmatch(name)
             and _is_safe_cookie_value(value)
         ):
-            # A flat Cookie header cannot retain domain scope. For duplicate
-            # names, keep the value scoped directly to m.weibo.cn when present.
-            priority = 0 if normalized_domain == "m.weibo.cn" else 1
-            if (
-                name not in netscape_priorities
-                or priority <= netscape_priorities[name]
-            ):
-                netscape_cookies[name] = value
-                netscape_priorities[name] = priority
+            netscape_cookies[name] = value
 
     # 避免把 Netscape 文件整行再次误当成 HTTP 请求头。
     if netscape_cookies:

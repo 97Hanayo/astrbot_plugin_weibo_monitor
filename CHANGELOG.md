@@ -2,13 +2,15 @@
 
 ## 未发布
 
+- **桌面端内容适配**：支持 `mblogid`、`pic_infos`、视频 `media_info` 和长微博全文；继续接受移动端分享链接，但实际抓取统一使用桌面端接口。
+
 - **验证收敛修复**：登录成功时允许辅助 Cookie 每次请求变化，返回已实际验证的请求 Cookie；仅登录凭据轮换时继续校验，避免将有效会话误报为“Cookie 持续变化”。
 - **后台 Cookie 更新**：通过框架配置指纹识别手动更新，后台新值会同步替换旧 Cookie 文件；框架配置保存失败时仍保留文件中的续期值。登录验证日志区分未登录、异常响应与请求失败。
-- **微博 Cookie 域隔离**：仅从 `m.weibo.cn` 刷新会话并保存 `weibo.cn` 移动端 Cookie；忽略桌面端 `weibo.com` 的同名 Cookie，避免覆盖后导致移动端登录态失效。
-- **登录凭据续期**：恢复 `SUB`、`SUBP`、`WBPSESS` 的服务端更新；候选值经过独立移动端登录验证且 UID 一致后才保存，拒绝未登录、跨账号和过期请求的更新。
+- **微博 Cookie 域隔离**：认证、保活、动态列表及单条微博详情统一切换到 `weibo.com` 桌面端接口；只保存可用于 `weibo.com` 的 Cookie，排除移动端同名值。旧版 Cookie 需要重新获取，订阅配置保持兼容。
+- **登录凭据续期**：恢复 `SUB`、`SUBP`、`WBPSESS` 的服务端更新；候选值经过独立桌面端登录验证且 UID 一致后才保存，拒绝未登录、跨账号和过期请求的更新。
 - **保活诊断**：INFO 日志记录保活、验证、降级和保存的字段名，避免把访问成功误报为凭据已续期；不输出 Cookie 值。
 - **Cookie 持久化修复**：插件重载时优先使用 `cookies/weibo_cookies.txt` 中的已续期 Cookie，避免旧配置覆盖服务端更新值。
-- **Cookie 保活**：默认每 12 小时用 Playwright 加载微博移动端页面，读取最终 Cookie 状态并原子写回本地文件；Playwright 不可用时降级到移动端 `/api/config`。
+- **Cookie 保活**：默认每 12 小时用 Playwright 加载微博桌面端页面，读取最终 Cookie 状态并原子写回本地文件；Playwright 不可用时降级到桌面端 `/ajax/config/get_config`。
 - **文件名兼容**：统一识别 `cookies/weibo_cookies.txt`，首次启动时自动迁移旧的 `weibo_cookie.txt`。
 - **校验保护**：微博返回 `login: false` 并尝试删除登录 Cookie 时，不再把残缺 Cookie 持久化覆盖原值。
 

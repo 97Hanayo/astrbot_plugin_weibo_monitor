@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import urlparse
+from .weibo_session import login_uid
 
 try:
     from astrbot.api import logger
@@ -155,20 +156,15 @@ async def collect_browser_cookies(
                 extra_http_headers={
                     "Accept": "application/json, text/plain, */*",
                     "X-Requested-With": "XMLHttpRequest",
-                    "MWeibo-Pwa": "1",
                 },
             )
             try:
                 seed_cookies = []
                 for refresh_url in refresh_urls:
                     host = (urlparse(refresh_url).hostname or "").lower()
-                    if not host:
+                    if host != "weibo.com":
                         continue
-                    root_domain = (
-                        ".weibo.cn"
-                        if host == "weibo.cn" or host.endswith(".weibo.cn")
-                        else ".weibo.com"
-                    )
+                    root_domain = ".weibo.com"
                     seed_cookies.extend(
                         {
                             "name": name,
@@ -224,17 +220,13 @@ async def collect_browser_cookies(
                             raise RuntimeError(
                                 "Playwright Cookie 验证响应不是 JSON"
                             ) from exc
-                        login = (payload.get("data") or {}).get("login")
-                        if login is not True:
-                            raise RuntimeError(
-                                f"Playwright Cookie 验证未登录: login={login!r}"
-                            )
+                        login_uid(payload)
                     finally:
                         await page.close()
 
                 return [
                     cookie
-                    for cookie in await context.cookies()
+                    for cookie in await context.cookies(list(refresh_urls))
                     if _host_matches(cookie.get("domain", ""), allowed_domains)
                 ]
             finally:

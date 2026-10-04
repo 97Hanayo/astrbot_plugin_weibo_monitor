@@ -22,7 +22,7 @@ import astrbot.api.message_components as Comp
 from .weibo_cookies import (
     WeiboCookieFile,
     merge_set_cookie_headers,
-    is_mobile_weibo_domain,
+    is_desktop_weibo_domain,
     normalize_cookie_text,
     parse_cookie_text,
     serialize_cookie_header,
@@ -30,7 +30,7 @@ from .weibo_cookies import (
 )
 from .weibo_playwright import collect_browser_cookies
 from .weibo_session import (
-    CookieValidationError, LOGIN_COOKIE_NAMES, login_uid, validate_mobile_cookie,
+    CookieValidationError, LOGIN_COOKIE_NAMES, WEIBO_LOGIN_URL, login_data, login_uid, validate_desktop_cookie,
 )
 
 # 常量定义
@@ -41,14 +41,10 @@ MAX_CONCURRENT_REQUESTS = 5  # 最大并发请求数
 MAX_PUSH_QUEUE_SIZE = 100  # 推送队列最大积压条目数
 DEFAULT_MESSAGE_SEND_TIMEOUT = 60  # 普通主动消息发送超时（秒）
 DEFAULT_MESSAGE_TEMPLATE = "🔔 {name} 发微博啦！\n\n{weibo}\n\n链接: {link}"
-WEIBO_API_BASE = "https://m.weibo.cn/api/container/getIndex"
-WEIBO_MOBILE_BASE = "https://m.weibo.cn"
+WEIBO_API_BASE = "https://weibo.com/ajax/statuses/mymblog"
 WEIBO_WEB_BASE = "https://weibo.com"
-# /api/config is the authenticated mobile endpoint used by the health check.
-# Keep this plugin's refresh jar on weibo.cn; desktop cookies can have different
-# values under the same names and must not replace mobile-session cookies.
-WEIBO_COOKIE_REFRESH_URL = f"{WEIBO_MOBILE_BASE}/api/config"
-WEIBO_BROWSER_REFRESH_URLS = (f"{WEIBO_MOBILE_BASE}/",)
+WEIBO_COOKIE_REFRESH_URL = WEIBO_LOGIN_URL
+WEIBO_BROWSER_REFRESH_URLS = (f"{WEIBO_WEB_BASE}/",)
 WEIBO_LOGIN_COOKIE_NAMES = LOGIN_COOKIE_NAMES
 HOTSEARCH_API_URL = "https://weibo.com/ajax/side/hotSearch"
 DEFAULT_HOTSEARCH_INTERVAL = 60
@@ -998,7 +994,7 @@ class WeiboMonitor(Star):
     async def _validate_cookie_candidate(self, cookie: str, expected_uid=None):
         # A separate client avoids recursive Set-Cookie hooks and shares no jar.
         async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
-            return await validate_mobile_cookie(
+            return await validate_desktop_cookie(
                 client, cookie, self.get_headers(), expected_uid,
             )
 
@@ -1096,12 +1092,12 @@ class WeiboMonitor(Star):
             response_host = getattr(response_url, "host", "") or getattr(
                 request_url, "host", ""
             )
-            if not is_mobile_weibo_domain(response_host):
+            if not is_desktop_weibo_domain(response_host):
                 return
             current_cookie = self._get_cookie_value()
             if normalize_cookie_text(response.request.headers.get("Cookie", "")) != current_cookie:
                 return
-            if getattr(response_url, "path", "") == "/api/config":
+            if getattr(response_url, "path", "") == "/ajax/config/get_config":
                 await response.aread()
                 if response.status_code != 200:
                     return
@@ -1117,7 +1113,7 @@ class WeiboMonitor(Star):
                 current_cookie,
                 set_cookie_headers,
                 response_host,
-                allowed_domains=("weibo.cn",),
+                allowed_domains=("weibo.com",),
             )
             if not accepted or not refreshed_cookie or not changed:
                 return
@@ -1141,7 +1137,6 @@ class WeiboMonitor(Star):
                 return
             current = parse_cookie_text(current_cookie)
             updates: Dict[str, str] = {}
-            priorities: Dict[str, int] = {}
             for browser_cookie in browser_cookies:
                 domain = (
                     str(browser_cookie.get("domain") or "")
@@ -1149,11 +1144,8 @@ class WeiboMonitor(Star):
                     .rstrip(".")
                     .lstrip(".")
                 )
-                if domain in {"passport.weibo.com", "passport.weibo.cn"}:
+                if not is_desktop_weibo_domain(domain):
                     continue
-                if not is_mobile_weibo_domain(domain):
-                    continue
-                priority = 0 if domain == "m.weibo.cn" else 1
 
                 name = str(browser_cookie.get("name") or "").strip()
                 value = str(browser_cookie.get("value") or "").strip()
@@ -1164,9 +1156,7 @@ class WeiboMonitor(Star):
                     for character in (*name, *value)
                 ):
                     continue
-                if name not in priorities or priority <= priorities[name]:
-                    updates[name] = value
-                    priorities[name] = priority
+                updates[name] = value
 
             if not updates:
                 return
@@ -1200,7 +1190,7 @@ class WeiboMonitor(Star):
             return
         self._last_cookie_refresh_at = now
 
-        self._log_cookie_refresh("info", "WeiboMonitor: 开始移动端 Cookie 保活与登录验证")
+        self._log_cookie_refresh("info", "WeiboMonitor: 开始桌面端 Cookie 保活与登录验证")
         try:
             uid, verified_cookie = await self._validate_cookie_candidate(cookie)
         except Exception as exc:
@@ -1214,7 +1204,7 @@ class WeiboMonitor(Star):
                 return
             self._remember_cookie_identity(cookie, uid)
             if verified_cookie != cookie:
-                await self._persist_refreshed_cookie(cookie, verified_cookie, "移动端登录验证续期")
+                await self._persist_refreshed_cookie(cookie, verified_cookie, "桌面端登录验证续期")
             cookie = self._get_cookie_value()
 
         headers = self.get_headers()
@@ -1222,7 +1212,7 @@ class WeiboMonitor(Star):
             browser_cookies = await collect_browser_cookies(
                 cookies=parse_cookie_text(cookie),
                 refresh_urls=WEIBO_BROWSER_REFRESH_URLS,
-                allowed_domains=("weibo.cn",),
+                allowed_domains=("weibo.com",),
                 user_agent=headers.get("User-Agent", ""),
                 timeout_ms=DEFAULT_TIMEOUT * 1000,
                 browser_path=self.data_dir / "playwright-browsers",
@@ -1245,7 +1235,7 @@ class WeiboMonitor(Star):
             )
 
         headers["Accept"] = "application/json, text/plain, */*"
-        headers["Referer"] = f"{WEIBO_MOBILE_BASE}/"
+        headers["Referer"] = f"{WEIBO_WEB_BASE}/"
         try:
             async with self._request_semaphore:
                 response = await self.client.get(
@@ -1256,7 +1246,7 @@ class WeiboMonitor(Star):
             if response.status_code == 200:
                 try:
                     response_data = response.json()
-                    login = (response_data.get("data") or {}).get("login")
+                    login = login_data(response_data).get("login")
                     if login is True:
                         login_state = "true"
                     elif login is False:
@@ -2295,14 +2285,14 @@ class WeiboMonitor(Star):
         """获取请求头"""
         cookie = self._get_cookie_value()
         headers = {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
             "X-Requested-With": "XMLHttpRequest",
         }
         if uid:
-            headers["Referer"] = f"{WEIBO_MOBILE_BASE}/u/{uid}"
+            headers["Referer"] = f"{WEIBO_WEB_BASE}/u/{uid}"
         else:
-            headers["Referer"] = f"{WEIBO_MOBILE_BASE}/"
+            headers["Referer"] = f"{WEIBO_WEB_BASE}/"
 
         if cookie:
             headers["Cookie"] = cookie
@@ -2350,10 +2340,13 @@ class WeiboMonitor(Star):
         """从微博博文数据中提取高清图片 URL 列表"""
         image_urls = []
         pics = mblog.get("pics") or []
+        pic_infos = mblog.get("pic_infos") or {}
+        if isinstance(pic_infos, dict) and pic_infos:
+            pics = [pic_infos.get(pic_id) for pic_id in (mblog.get("pic_ids") or pic_infos)]
         for pic in pics:
             if not isinstance(pic, dict):
                 continue
-            large = pic.get("large") or {}
+            large = pic.get("original") or pic.get("largest") or pic.get("large") or {}
             url = large.get("url") or pic.get("url")
             if url:
                 if url.startswith("//"):
@@ -2383,8 +2376,20 @@ class WeiboMonitor(Star):
             return None
 
         urls = page_info.get("urls") or {}
+        media_info = page_info.get("media_info") or {}
         video_url = None
+        playback = [
+            item.get("play_info") for item in (media_info.get("playback_list") or [])
+            if isinstance(item, dict) and isinstance(item.get("play_info"), dict)
+            and item["play_info"].get("url")
+        ]
+        if playback:
+            video_url = max(playback, key=lambda info: float(info.get("bitrate") or 0)).get("url")
+        if not video_url:
+            video_url = media_info.get("stream_url_hd") or media_info.get("stream_url")
         for quality in ("mp4_720p_mp4", "mp4_hd_mp4", "mp4_ld_mp4"):
+            if video_url:
+                break
             video_url = urls.get(quality)
             if video_url:
                 break
@@ -2396,7 +2401,7 @@ class WeiboMonitor(Star):
 
         return {
             "url": video_url,
-            "cover": page_info.get("page_pic"),
+            "cover": page_info.get("page_pic") or media_info.get("poster"),
             "duration": (page_info.get("media_info") or {}).get("duration"),
             "title": page_info.get("page_title"),
         }
@@ -2405,8 +2410,8 @@ class WeiboMonitor(Star):
         """下载图片到临时目录，返回本地文件路径"""
         try:
             headers = {
-                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
-                "Referer": "https://m.weibo.cn/",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "Referer": "https://weibo.com/",
             }
             cookie = self._get_cookie_value()
             if cookie:
@@ -2449,8 +2454,8 @@ class WeiboMonitor(Star):
         max_size_mb = self._get_config("max_video_size_mb", 0)
         max_bytes = max_size_mb * 1024 * 1024 if max_size_mb > 0 else None
         headers = {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
-            "Referer": "https://m.weibo.cn/",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Referer": "https://weibo.com/",
         }
         cookie = self._get_cookie_value()
         if cookie:
@@ -2737,44 +2742,47 @@ class WeiboMonitor(Star):
     async def _fetch_single_weibo(self, bid: str) -> Optional[dict]:
         """通过 bid 抓取单条微博详情，返回 post dict 或 None"""
         try:
-            api_url = f"{WEIBO_MOBILE_BASE}/statuses/show?id={bid}"
+            api_url = f"{WEIBO_WEB_BASE}/ajax/statuses/show?id={quote(bid, safe='')}"
             async with self._request_semaphore:
                 resp = await self.client.get(api_url, headers=self.get_headers())
-                if resp.status_code != 200:
-                    self.plugin_logger.warning(
-                        f"获取单条微博失败，状态码: {resp.status_code}，bid: {bid}"
-                    )
-                    return None
-                data = resp.json()
-                if data.get("ok") != 1:
-                    self.plugin_logger.warning(f"获取单条微博数据异常，bid: {bid}")
-                    return None
-                mblog = data.get("data")
-                if not mblog or not isinstance(mblog, dict):
-                    return None
-
-                uid = (mblog.get("user") or {}).get("idstr") or str(
-                    (mblog.get("user") or {}).get("id", "")
+            if resp.status_code != 200:
+                self.plugin_logger.warning(
+                    f"获取单条微博失败，状态码: {resp.status_code}，bid: {bid}"
                 )
-                username = (mblog.get("user") or {}).get("screen_name", "未知用户")
-                text = self.clean_text(mblog.get("text", ""))
-                link = (
-                    f"{WEIBO_WEB_BASE}/{uid}/{bid}"
-                    if uid
-                    else f"{WEIBO_WEB_BASE}/detail/{bid}"
-                )
-                created_at = self._parse_weibo_time(mblog.get("created_at", ""))
-                image_urls = self._extract_image_urls(mblog)
-                video_info = self._extract_video_info(mblog)
+                return None
+            data = resp.json()
+            if not isinstance(data, dict) or data.get("ok") not in (None, 1):
+                self.plugin_logger.warning(f"获取单条微博数据异常，bid: {bid}")
+                return None
+            mblog = data.get("data") if isinstance(data.get("data"), dict) else data
+            if not mblog or not isinstance(mblog, dict):
+                return None
 
-                return {
-                    "text": text,
-                    "link": link,
-                    "username": username,
-                    "created_at": created_at,
-                    "image_urls": image_urls,
-                    "video_info": video_info,
-                }
+            if not (mblog.get("id") or mblog.get("idstr")):
+                return None
+            mblog = await self._prepare_desktop_mblog(mblog)
+            uid = (mblog.get("user") or {}).get("idstr") or str(
+                (mblog.get("user") or {}).get("id", "")
+            )
+            username = (mblog.get("user") or {}).get("screen_name", "未知用户")
+            text = self.clean_text(mblog.get("text", ""))
+            link = (
+                f"{WEIBO_WEB_BASE}/{uid}/{bid}"
+                if uid
+                else f"{WEIBO_WEB_BASE}/detail/{bid}"
+            )
+            created_at = self._parse_weibo_time(mblog.get("created_at", ""))
+            image_urls = self._extract_image_urls(mblog)
+            video_info = self._extract_video_info(mblog)
+
+            return {
+                "text": text,
+                "link": link,
+                "username": username,
+                "created_at": created_at,
+                "image_urls": image_urls,
+                "video_info": video_info,
+            }
         except Exception as e:
             self.plugin_logger.error(f"抓取单条微博出错: {e}，bid: {bid}")
             return None
@@ -3051,11 +3059,11 @@ class WeiboMonitor(Star):
         yield event.plain_result("🔍 正在验证 Cookie 有效性...")
         try:
             resp = await self.client.get(
-                "https://m.weibo.cn/api/config", headers=self.get_headers()
+                WEIBO_COOKIE_REFRESH_URL, headers=self.get_headers()
             )
             if resp.status_code == 200:
                 data = resp.json()
-                data_obj = data.get("data") or {}
+                data_obj = login_data(data)
                 login = data_obj.get("login")
                 if login is True:
                     self._set_cookie_health_status("valid")
@@ -3144,11 +3152,11 @@ class WeiboMonitor(Star):
         )
         try:
             resp = await self.client.get(
-                "https://m.weibo.cn/api/config", headers=self.get_headers()
+                WEIBO_COOKIE_REFRESH_URL, headers=self.get_headers()
             )
             if resp.status_code == 200:
                 data = resp.json()
-                data_obj = data.get("data") or {}
+                data_obj = login_data(data)
                 login = data_obj.get("login")
                 if login is True:
                     if not self._set_cookie_health_status("valid"):
@@ -3774,11 +3782,11 @@ class WeiboMonitor(Star):
         """检查 Cookie 健康状态，区分明确失效与临时验证错误。"""
         try:
             resp = await self.client.get(
-                f"{WEIBO_MOBILE_BASE}/api/config", headers=self.get_headers()
+                WEIBO_COOKIE_REFRESH_URL, headers=self.get_headers()
             )
             if resp.status_code == 200:
                 data = resp.json()
-                login = (data.get("data") or {}).get("login")
+                login = login_data(data).get("login")
                 if login is True:
                     return "valid"
                 if login is False:
@@ -4360,7 +4368,7 @@ class WeiboMonitor(Star):
             try:
                 async with self._request_semaphore:
                     resp = await self.client.get(
-                        f"{WEIBO_MOBILE_BASE}/n/{name}",
+                        f"{WEIBO_WEB_BASE}/n/{name}",
                         headers=self.get_headers(),
                     )
                 if resp.status_code == 429:
@@ -4370,11 +4378,11 @@ class WeiboMonitor(Star):
                     await asyncio.sleep(60)
                     async with self._request_semaphore:
                         resp = await self.client.get(
-                            f"{WEIBO_MOBILE_BASE}/n/{name}",
+                            f"{WEIBO_WEB_BASE}/n/{name}",
                             headers=self.get_headers(),
                         )
                 final_url = str(resp.url)
-                match_uid = re.search(r"/u/(\d+)", final_url)
+                match_uid = re.search(r"/(?:u/)?(\d+)(?:[/?#]|$)", final_url)
                 if match_uid:
                     return match_uid.group(1)
                 self.plugin_logger.debug(
@@ -4386,7 +4394,7 @@ class WeiboMonitor(Star):
 
     async def _fetch_weibo_cards(self, uid: str) -> List[dict]:
         """获取指定UID的微博卡片列表"""
-        api_url = f"{WEIBO_API_BASE}?type=uid&value={uid}&containerid=107603{uid}"
+        api_url = f"{WEIBO_API_BASE}?uid={uid}&page=1&feature=0"
         try:
             async with self._request_semaphore:
                 resp = await self.client.get(api_url, headers=self.get_headers(uid))
@@ -4414,10 +4422,43 @@ class WeiboMonitor(Star):
                     f"WeiboMonitor: 接口返回数据状态异常, UID: {uid}"
                 )
                 return []
-            return (data.get("data") or {}).get("cards", [])
+            statuses = (data.get("data") or {}).get("list", [])
+            if not isinstance(statuses, list):
+                return []
+            cards = []
+            for status in statuses:
+                if isinstance(status, dict) and (status.get("id") or status.get("idstr")):
+                    cards.append({"card_type": 9, "mblog": await self._prepare_desktop_mblog(status)})
+            return cards
         except Exception as e:
             self.plugin_logger.error(f"WeiboMonitor: 获取UID {uid} 数据时出错: {e}")
             return []
+
+    async def _prepare_desktop_mblog(self, status: dict) -> dict:
+        """Adapt desktop status IDs and hydrate truncated text before filtering."""
+        mblog = dict(status)
+        mblog["id"] = status.get("idstr") or status.get("id")
+        mblog["bid"] = status.get("mblogid") or status.get("bid")
+        if not mblog.get("text"):
+            mblog["text"] = status.get("text_raw", "")
+        if status.get("isLongText") and mblog.get("id"):
+            try:
+                async with self._request_semaphore:
+                    response = await self.client.get(
+                        f"{WEIBO_WEB_BASE}/ajax/statuses/longtext",
+                        params={"id": str(mblog["id"])}, headers=self.get_headers(),
+                    )
+                if response.status_code == 200:
+                    payload = response.json()
+                    if payload.get("ok") == 1:
+                        text = (payload.get("data") or {}).get("longTextContent")
+                        if text:
+                            mblog["text"] = text
+            except Exception as exc:
+                self.plugin_logger.warning("WeiboMonitor: 获取长微博失败（%s）", type(exc).__name__)
+        if isinstance(status.get("retweeted_status"), dict):
+            mblog["retweeted_status"] = await self._prepare_desktop_mblog(status["retweeted_status"])
+        return mblog
 
     def _extract_valid_mblogs(
         self, cards: List[Dict[str, Any]]

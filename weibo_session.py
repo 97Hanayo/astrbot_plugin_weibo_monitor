@@ -1,4 +1,4 @@
-"""Validate a mobile Cookie candidate without the monitor's response hooks."""
+"""Validate a desktop Cookie candidate without the monitor's response hooks."""
 
 from .weibo_cookies import (
     merge_set_cookie_headers,
@@ -8,15 +8,36 @@ from .weibo_cookies import (
 )
 
 LOGIN_COOKIE_NAMES = ("SUB", "SUBP", "WBPSESS")
+WEIBO_LOGIN_URL = "https://weibo.com/ajax/config/get_config"
 
 
 class CookieValidationError(ValueError):
     pass
 
 
-def login_uid(payload):
+def login_data(payload):
+    """Normalize desktop config responses; a successful visitor config is not login."""
     data = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(data, dict) or data.get("login") is not True:
+    if not isinstance(data, dict) or payload.get("ok") != 1:
+        return {}
+    data = dict(data)
+    user = data.get("user") or {}
+    uid = data.get("uid")
+    if uid is None or uid == "":
+        uid = user.get("id") if isinstance(user, dict) else None
+    if data.get("login") is False or str(uid) == "0":
+        data["login"] = False
+    elif uid and str(uid).isdigit():
+        data["login"] = True
+        data["uid"] = str(uid)
+    else:
+        data.pop("login", None)
+    return data
+
+
+def login_uid(payload):
+    data = login_data(payload)
+    if data.get("login") is not True:
         raise CookieValidationError("接口未确认登录")
     user = data.get("user") or {}
     uid = data.get("uid") or (user.get("id") if isinstance(user, dict) else None)
@@ -25,7 +46,7 @@ def login_uid(payload):
     return str(uid)
 
 
-async def validate_mobile_cookie(client, cookie, headers, expected_uid=None):
+async def validate_desktop_cookie(client, cookie, headers, expected_uid=None):
     """Return (UID, verified header); reject logout, account switches or churn.
 
     The client must have no response hooks. Return a header that was actually
@@ -40,7 +61,7 @@ async def validate_mobile_cookie(client, cookie, headers, expected_uid=None):
         request_headers = dict(headers)
         request_headers["Cookie"] = candidate
         response = await client.get(
-            "https://m.weibo.cn/api/config", headers=request_headers,
+            WEIBO_LOGIN_URL, headers=request_headers,
             follow_redirects=False,
         )
         if response.status_code != 200:
@@ -54,8 +75,8 @@ async def validate_mobile_cookie(client, cookie, headers, expected_uid=None):
             raise CookieValidationError("候选 Cookie 的账号不一致")
         identity = uid
         updated, _, changed = merge_set_cookie_headers(
-            candidate, response.headers.get_list("set-cookie"), "m.weibo.cn",
-            allowed_domains=("weibo.cn",),
+            candidate, response.headers.get_list("set-cookie"), "weibo.com",
+            allowed_domains=("weibo.com",),
         )
         if would_remove_login_cookie(candidate, updated):
             raise CookieValidationError("验证响应删除了登录凭据")

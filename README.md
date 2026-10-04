@@ -10,7 +10,7 @@
 - **定时监控**：自定义检查频率，支持间隔随机化避免被反爬。
 - **多用户支持**：可同时监控多个微博账号，支持URL、UID、用户名三种输入格式。
 - **精准推送**：仅推送最新更新，自动过滤置顶微博。
-- **Cookie 配置**：支持配置项或插件数据目录 `cookies/weibo_cookies.txt`，兼容请求头与 Netscape 格式；本插件只从微博移动端（`m.weibo.cn`）刷新并保存 Cookie，避免桌面端 `weibo.com` 的同名 Cookie 覆盖移动端会话；Playwright 不可用时降级请求移动端 `/api/config`。
+- **Cookie 配置**：使用 `weibo.com` 桌面端 Cookie，支持配置项或插件数据目录 `cookies/weibo_cookies.txt`，兼容请求头与 Netscape 格式；Playwright 保活只保存桌面端 Cookie，不可用时降级请求 `/ajax/config/get_config`。
 - **灵活过滤**：支持屏蔽词过滤、白名单关键词过滤，可选择是否推送原创/转发微博。
 - **消息自定义**：支持自定义推送消息格式，满足不同需求。
 - **配置导入导出**：支持配置的导入导出，方便迁移和备份。
@@ -312,22 +312,22 @@ group_fans_C: 2534531481, 5310078607, https://weibo.com/n/某明星
 
 ### 如何获取微博 Cookie
 
-1. 在电脑浏览器打开 [微博移动端官网](https://m.weibo.cn/) 并登录。
+1. 在电脑浏览器打开 [微博桌面端官网](https://weibo.com/) 并登录。
 2. 按 `F12` 打开开发者工具，切换到 `网络 (Network)` 选项卡。
-3. 刷新页面，在左侧列表中找到 `m.weibo.cn` 请求。
+3. 刷新页面，在左侧列表中找到 `weibo.com` 的请求（例如 `/ajax/config/get_config`）。
 4. 在右侧的 `请求标头 (Request Headers)` 中找到 `Cookie` 字段。
 5. 复制该字段的完整值，粘贴到插件设置的 `weibo_cookie` 中；也可保存到插件数据目录的 `cookies/weibo_cookies.txt`。
 
 ### Cookie 注意事项
 
 - Cookie具有有效期，失效后需要重新获取
-- `weibo_cookies.txt` 支持浏览器导出的 Netscape 格式和 `name=value; ...` 请求头格式；Netscape 文件只采用 `weibo.cn` / `m.weibo.cn` 域记录。请求头请从 `m.weibo.cn` 获取，`weibo.com` 桌面端的同名 Cookie 可能对应不同会话
-- 插件默认每 12 小时用 Playwright 加载微博移动端页面，读取 `weibo.cn` 域的 Cookie 并原子回写文件；桌面端 `weibo.com` 的 Cookie 不会覆盖移动端会话。Playwright 不可用时降级请求移动端 `/api/config`，可在“微博账号与认证”中关闭或调整间隔
-- 自动保活允许更新 `SUB`、`SUBP`、`WBPSESS` 等登录凭据；候选 Cookie 必须通过移动端登录验证且 UID 与原会话一致，才会写回文件。验证失败或刷新期间手动更换 Cookie 时保留原值
+- `weibo_cookies.txt` 支持浏览器导出的 Netscape 格式和 `name=value; ...` 请求头格式；Netscape 文件只采用 `weibo.com` / `.weibo.com` 域记录，排除 `weibo.cn` 和其他子域的同名 Cookie
+- 插件默认每 12 小时用 Playwright 加载微博桌面端页面并原子回写 Cookie 文件；不可用时降级请求桌面端 `/ajax/config/get_config`，可在“微博账号与认证”中关闭或调整间隔
+- 自动保活允许更新 `SUB`、`SUBP`、`WBPSESS` 等登录凭据；候选 Cookie 必须通过桌面端登录验证且 UID 与原会话一致，才会写回文件。验证失败或刷新期间手动更换 Cookie 时保留原值
 - AstrBot 的 WebUI 平台日志会以 INFO 级别记录保活开始、浏览器降级、登录验证与已保存的更新字段名，不记录 Cookie 值。访问成功但没有新值不代表登录凭据已延长有效期；服务端已注销的会话需要重新登录获取 Cookie
 - 服务端若不续期或主动使登录失效，仍需重新获取 Cookie
 - 请勿在多设备同时登录同一账号，可能导致Cookie失效
-- 建议在浏览器开发者工具中复制 `m.weibo.cn` 请求的 Cookie；从 resolver 或 `weibo.com` 复制的桌面端 Cookie 不保证适用于移动端接口
+- 从移动端版本升级后，需要重新填入 `weibo.com` 的 Cookie；原有 `m.weibo.cn` Cookie 不能自动转换。可与 `astrbot_plugin_link_resolver` 使用同一份桌面端 Cookie，但两个插件的 Cookie 文件各自独立，续期结果不会自动互相同步
 - 配置完成后可使用 `/weibo_verify` 指令验证Cookie是否有效
 
 ## 常见问题
