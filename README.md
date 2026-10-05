@@ -293,7 +293,7 @@ group_fans_C: 2534531481, 5310078607, https://weibo.com/n/某明星
 > ⚠️ `/weibo_export`、`/weibo_import`、`/weibo_cookie` 仅对 AstrBot 全局 `admins_id` 中的管理员开放。管理员 ID 必须在 AstrBot 管理面板/全局配置文件中添加，不是在本插件配置中添加。
 
 - `/weibo_umo`: 获取当前会话 ID（必须在准备接收推送的目标群聊或私聊中执行，只复制命令返回的完整 ID）。
-- `/weibo_verify`: 验证当前设置的 Cookie 是否有效。
+- `/weibo_verify`: 检查携带当前 Cookie 的请求是否成功，不检查响应的 `login` 或 UID 字段。
 - `/weibo_check`: 立即抓取列表里第一个账号并推送最新一条微博；结果按“成功目标数/计划目标数”报告。没有匹配的订阅目标时使用当前会话兜底，并在结果中明确标注。
 - `/weibo_check_all`: 立即抓取列表里所有账号并推送最新一条微博；逐个报告“成功目标数/计划目标数”，不会在正文实际发送失败时误报成功。
 - `/weibo_status`: 查看当前监控状态、微博动态推送是否就绪及 Cookie、监控博主、有效订阅分组等缺失项。
@@ -323,8 +323,9 @@ group_fans_C: 2534531481, 5310078607, https://weibo.com/n/某明星
 - Cookie具有有效期，失效后需要重新获取
 - `weibo_cookies.txt` 支持浏览器导出的 Netscape 格式和 `name=value; ...` 请求头格式；Netscape 文件只采用 `weibo.com` / `.weibo.com` 域记录，排除 `weibo.cn` 和其他子域的同名 Cookie
 - 插件默认每 12 小时用 Playwright 加载微博桌面端页面并原子回写 Cookie 文件；不可用时降级请求桌面端 `/ajax/config/get_config`，可在“微博账号与认证”中关闭或调整间隔
-- 自动保活允许更新 `SUB`、`SUBP`、`WBPSESS` 等登录凭据；候选 Cookie 必须通过桌面端登录验证且 UID 与原会话一致，才会写回文件。验证失败或刷新期间手动更换 Cookie 时保留原值
-- AstrBot 的 WebUI 平台日志会以 INFO 级别记录保活开始、浏览器降级、登录验证与已保存的更新字段名，不记录 Cookie 值。访问成功但没有新值不代表登录凭据已延长有效期；服务端已注销的会话需要重新登录获取 Cookie
+- 配置 Cookie 后直接携带其值抓取；不依据配置接口的 `login` 或 UID 字段暂停监控，检查请求失败也不会阻止动态抓取
+- 自动保活默认每 12 小时执行，允许更新 `SUB`、`SUBP`、`WBPSESS` 等服务端凭据并写回文件，不要求登录验证或 UID 一致；仍拒绝清空现有登录凭据的更新，刷新期间手动更换 Cookie 时丢弃旧会话结果
+- AstrBot 的 WebUI 平台日志会以 INFO 级别记录保活开始、浏览器降级与已保存的更新字段名，不记录 Cookie 值。访问成功但没有新值不代表登录凭据已延长有效期；服务端已注销的会话需要重新登录获取 Cookie
 - 服务端若不续期或主动使登录失效，仍需重新获取 Cookie
 - 请勿在多设备同时登录同一账号，可能导致Cookie失效
 - 从移动端版本升级后，需要重新填入 `weibo.com` 的 Cookie；原有 `m.weibo.cn` Cookie 不能自动转换。可与 `astrbot_plugin_link_resolver` 使用同一份桌面端 Cookie，但两个插件的 Cookie 文件各自独立，续期结果不会自动互相同步

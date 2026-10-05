@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import shutil
@@ -12,7 +11,6 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import urlparse
-from .weibo_session import login_uid
 
 try:
     from astrbot.api import logger
@@ -131,13 +129,8 @@ async def collect_browser_cookies(
     user_agent: str,
     timeout_ms: int,
     browser_path: Path | None = None,
-    login_check_url: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Load seeded cookies in Chromium and return the effective Cookie jar.
-
-    The optional login check prevents a logged-out page from replacing a valid
-    user Cookie with a visitor session before the caller persists the result.
-    """
+    """Load seeded cookies in Chromium and return the effective Cookie jar."""
     if not cookies or not refresh_urls:
         return []
 
@@ -198,29 +191,6 @@ async def collect_browser_cookies(
                                 )
                             except Exception:
                                 pass
-                    finally:
-                        await page.close()
-
-                if login_check_url:
-                    page = await context.new_page()
-                    try:
-                        response = await page.goto(
-                            login_check_url,
-                            wait_until="domcontentloaded",
-                            timeout=max(1000, int(timeout_ms)),
-                        )
-                        if response is None or response.status != 200:
-                            status = response.status if response is not None else "unknown"
-                            raise RuntimeError(
-                                f"Playwright Cookie 验证状态码异常: {status}"
-                            )
-                        try:
-                            payload = json.loads(await page.locator("body").inner_text())
-                        except json.JSONDecodeError as exc:
-                            raise RuntimeError(
-                                "Playwright Cookie 验证响应不是 JSON"
-                            ) from exc
-                        login_uid(payload)
                     finally:
                         await page.close()
 

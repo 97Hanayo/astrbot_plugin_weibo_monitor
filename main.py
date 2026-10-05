@@ -29,9 +29,7 @@ from .weibo_cookies import (
     would_remove_login_cookie,
 )
 from .weibo_playwright import collect_browser_cookies
-from .weibo_session import (
-    CookieValidationError, LOGIN_COOKIE_NAMES, WEIBO_LOGIN_URL, login_data, login_uid, validate_desktop_cookie,
-)
+from .weibo_session import WEIBO_LOGIN_URL, login_data
 
 # 常量定义
 DEFAULT_CHECK_INTERVAL = 10  # 默认检查间隔（分钟）
@@ -45,7 +43,6 @@ WEIBO_API_BASE = "https://weibo.com/ajax/statuses/mymblog"
 WEIBO_WEB_BASE = "https://weibo.com"
 WEIBO_COOKIE_REFRESH_URL = WEIBO_LOGIN_URL
 WEIBO_BROWSER_REFRESH_URLS = (f"{WEIBO_WEB_BASE}/",)
-WEIBO_LOGIN_COOKIE_NAMES = LOGIN_COOKIE_NAMES
 HOTSEARCH_API_URL = "https://weibo.com/ajax/side/hotSearch"
 DEFAULT_HOTSEARCH_INTERVAL = 60
 DEFAULT_HOTSEARCH_TOP_N = 10
@@ -226,6 +223,10 @@ class WeiboMonitor(Star):
             self.cookie_health_checked_at = self._data.get(
                 "_cookie_health_checked_at", ""
             )
+        # 旧版本依据 login 字段记下的失效状态不再适用。
+        if configured_cookie and self.cookie_health_status == "invalid":
+            self.cookie_health_status = "unknown"
+            self.cookie_health_checked_at = ""
         self.next_push_time = ""
 
         self.last_summary_date = self._data.get("last_summary_date", "")
@@ -982,22 +983,6 @@ class WeiboMonitor(Star):
         # The standalone file/stream logger is not captured by AstrBot's WebUI.
         getattr(astrbot_logger, level)(message % args if args else message)
 
-    @staticmethod
-    def _cookie_validation_reason(exc: Exception) -> str:
-        # Only our controlled validation messages are safe to expose.
-        return str(exc) if isinstance(exc, CookieValidationError) else type(exc).__name__
-
-    def _remember_cookie_identity(self, cookie: str, uid: str):
-        self._data["_cookie_verified_uid"] = str(uid)
-        self._data["_cookie_verified_fingerprint"] = self._cookie_fingerprint(cookie)
-
-    async def _validate_cookie_candidate(self, cookie: str, expected_uid=None):
-        # A separate client avoids recursive Set-Cookie hooks and shares no jar.
-        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
-            return await validate_desktop_cookie(
-                client, cookie, self.get_headers(), expected_uid,
-            )
-
     async def _persist_refreshed_cookie(
         self,
         current_cookie: str,
@@ -1021,23 +1006,6 @@ class WeiboMonitor(Star):
         if normalize_cookie_text(current_cookie) != self._get_cookie_value():
             self.plugin_logger.info("WeiboMonitor: Cookie 已被更新，丢弃旧会话的续期结果")
             return False
-        try:
-            expected_uid = None
-            if self._data.get("_cookie_verified_fingerprint") == self._cookie_fingerprint(current_cookie):
-                expected_uid = self._data.get("_cookie_verified_uid")
-            if not expected_uid:
-                expected_uid, _ = await self._validate_cookie_candidate(current_cookie)
-            uid, refreshed_cookie = await self._validate_cookie_candidate(
-                refreshed_cookie, expected_uid,
-            )
-        except Exception as exc:
-            self._log_cookie_refresh(
-                "warning", "WeiboMonitor: Cookie 续期候选验证失败，保留原值（%s）", self._cookie_validation_reason(exc),
-            )
-            return False
-        if self._get_cookie_value() != normalize_cookie_text(current_cookie):
-            self.plugin_logger.info("WeiboMonitor: 验证期间 Cookie 已被更新，丢弃旧会话结果")
-            return False
         previous = parse_cookie_text(current_cookie)
         updated = parse_cookie_text(refreshed_cookie)
         changed_names = sorted(
@@ -1052,14 +1020,13 @@ class WeiboMonitor(Star):
             return False
 
         self._set_config("weibo_cookie", refreshed_cookie)
-        self._remember_cookie_identity(refreshed_cookie, uid)
         self._data["_backup_weibo_cookie"] = refreshed_cookie
         self._data["_cookie_fingerprint"] = self._cookie_fingerprint(
             refreshed_cookie
         )
         self._save_data()
         self._log_cookie_refresh(
-            "info", "WeiboMonitor: Cookie 续期已验证同一账号并写入文件，更新字段=%s", ",".join(changed_names),
+            "info", "WeiboMonitor: Cookie 保活更新已写入文件，更新字段=%s", ",".join(changed_names),
         )
         if not await self._save_plugin_config_async(reason):
             self._log_cookie_refresh(
@@ -1097,15 +1064,8 @@ class WeiboMonitor(Star):
             current_cookie = self._get_cookie_value()
             if normalize_cookie_text(response.request.headers.get("Cookie", "")) != current_cookie:
                 return
-            if getattr(response_url, "path", "") == "/ajax/config/get_config":
-                await response.aread()
-                if response.status_code != 200:
-                    return
-                try:
-                    uid = login_uid(response.json())
-                except (TypeError, ValueError):
-                    return
-                self._remember_cookie_identity(current_cookie, uid)
+            if response.status_code != 200:
+                return
             set_cookie_headers = response.headers.get_list("set-cookie")
             if not set_cookie_headers:
                 return
@@ -1190,23 +1150,7 @@ class WeiboMonitor(Star):
             return
         self._last_cookie_refresh_at = now
 
-        self._log_cookie_refresh("info", "WeiboMonitor: 开始桌面端 Cookie 保活与登录验证")
-        try:
-            uid, verified_cookie = await self._validate_cookie_candidate(cookie)
-        except Exception as exc:
-            self._log_cookie_refresh(
-                "warning", "WeiboMonitor: Cookie 保活验证未通过，保留原值（%s）；仅明确未登录时才需重新获取 Cookie",
-                self._cookie_validation_reason(exc),
-            )
-            return
-        async with self._cookie_refresh_lock:
-            if cookie != self._get_cookie_value():
-                return
-            self._remember_cookie_identity(cookie, uid)
-            if verified_cookie != cookie:
-                await self._persist_refreshed_cookie(cookie, verified_cookie, "桌面端登录验证续期")
-            cookie = self._get_cookie_value()
-
+        self._log_cookie_refresh("info", "WeiboMonitor: 开始桌面端 Cookie 保活")
         headers = self.get_headers()
         try:
             browser_cookies = await collect_browser_cookies(
@@ -1216,13 +1160,12 @@ class WeiboMonitor(Star):
                 user_agent=headers.get("User-Agent", ""),
                 timeout_ms=DEFAULT_TIMEOUT * 1000,
                 browser_path=self.data_dir / "playwright-browsers",
-                login_check_url=WEIBO_COOKIE_REFRESH_URL,
             )
             if not browser_cookies:
                 raise RuntimeError("Playwright 未返回微博 Cookie")
             await self._capture_playwright_cookie_updates(browser_cookies, cookie)
             self._log_cookie_refresh(
-                "info", "WeiboMonitor: Playwright 保活登录验证完成；仅验证并保存服务端实际更新，Cookie 数=%s",
+                "info", "WeiboMonitor: Playwright 保活完成；保存服务端实际更新，Cookie 数=%s",
                 len(browser_cookies),
             )
             return
@@ -1242,22 +1185,10 @@ class WeiboMonitor(Star):
                     WEIBO_COOKIE_REFRESH_URL,
                     headers=headers,
                 )
-            login_state = "unknown"
-            if response.status_code == 200:
-                try:
-                    response_data = response.json()
-                    login = login_data(response_data).get("login")
-                    if login is True:
-                        login_state = "true"
-                    elif login is False:
-                        login_state = "false"
-                except (TypeError, ValueError):
-                    pass
             self._log_cookie_refresh(
-                "info", "WeiboMonitor: HTTPX Cookie 保活请求完成，状态码 %s，login=%s；"
+                "info", "WeiboMonitor: HTTPX Cookie 保活请求完成，状态码 %s；"
                 "仅持久化响应 Set-Cookie，不使用 user_token",
                 response.status_code,
-                login_state,
             )
         except asyncio.CancelledError:
             raise
@@ -3050,42 +2981,33 @@ class WeiboMonitor(Star):
 
     @filter.command("weibo_verify")
     async def weibo_verify(self, event: AstrMessageEvent):
-        """验证当前配置的 Cookie 是否有效"""
+        """检查携带 Cookie 的请求，不检查 login 字段。"""
         cookie = self._get_cookie_value()
         if not cookie:
             yield event.plain_result("❌ 未配置 Cookie。")
             return
 
-        yield event.plain_result("🔍 正在验证 Cookie 有效性...")
+        yield event.plain_result("🔍 正在检查 Cookie 请求...")
         try:
             resp = await self.client.get(
                 WEIBO_COOKIE_REFRESH_URL, headers=self.get_headers()
             )
             if resp.status_code == 200:
-                data = resp.json()
-                data_obj = login_data(data)
-                login = data_obj.get("login")
-                if login is True:
-                    self._set_cookie_health_status("valid")
-                    user = data_obj.get("user")
-                    if user:
-                        yield event.plain_result(
-                            f"✅ Cookie 有效！\n当前登录用户: {user.get('screen_name')} (UID: {user.get('id')})"
-                        )
-                    else:
-                        uid = data_obj.get("uid")
-                        yield event.plain_result(
-                            f"✅ Cookie 有效！\n已登录但未获取到详细用户信息 (UID: {uid})"
-                        )
-                elif login is False:
-                    self._set_cookie_health_status("invalid")
+                try:
+                    data_obj = login_data(resp.json())
+                except (TypeError, ValueError):
+                    data_obj = {}
+                self._set_cookie_health_status("valid")
+                user = data_obj.get("user")
+                user = user if isinstance(user, dict) else {}
+                if user:
                     yield event.plain_result(
-                        "❌ Cookie 已失效或未登录（接口返回 login: false）。"
+                        f"✅ Cookie 请求成功（忽略 login 字段）！\n接口返回用户: {user.get('screen_name')} (UID: {user.get('id')})"
                     )
                 else:
-                    self._set_cookie_health_status("error")
+                    uid = data_obj.get("uid")
                     yield event.plain_result(
-                        "⚠️ 微博接口返回了无法识别的登录状态，暂时不能判断 Cookie 是否有效，请稍后重试。"
+                        f"✅ Cookie 请求成功（忽略 login 字段）！\n请求成功，账号信息仅供参考 (UID: {uid})"
                     )
             else:
                 self._set_cookie_health_status("error")
@@ -3148,77 +3070,62 @@ class WeiboMonitor(Star):
             persistence_message += "；⚠️ cookies/weibo_cookies.txt 写入失败"
 
         yield event.plain_result(
-            f"🔄 Cookie 已可靠保存，正在验证有效性...\n{persistence_message}"
+            f"🔄 Cookie 已可靠保存，正在检查请求...\n{persistence_message}"
         )
         try:
             resp = await self.client.get(
                 WEIBO_COOKIE_REFRESH_URL, headers=self.get_headers()
             )
             if resp.status_code == 200:
-                data = resp.json()
-                data_obj = login_data(data)
-                login = data_obj.get("login")
-                if login is True:
-                    if not self._set_cookie_health_status("valid"):
-                        self.plugin_logger.warning(
-                            "WeiboMonitor: Cookie 已验证有效，但健康状态未能落盘"
-                        )
-                    user = data_obj.get("user")
-                    user_info = (
-                        f"当前登录用户: {user.get('screen_name')} (UID: {user.get('id')})"
-                        if user
-                        else f"已登录 (UID: {data_obj.get('uid')})"
+                try:
+                    data_obj = login_data(resp.json())
+                except (TypeError, ValueError):
+                    data_obj = {}
+                if not self._set_cookie_health_status("valid"):
+                    self.plugin_logger.warning(
+                        "WeiboMonitor: Cookie 请求成功，但健康状态未能落盘"
                     )
-                    self.plugin_logger.info(
-                        f"WeiboMonitor: Cookie 已通过命令更换，{persistence_message}"
+                user = data_obj.get("user")
+                user = user if isinstance(user, dict) else {}
+                user_info = (
+                    f"接口返回用户: {user.get('screen_name')} (UID: {user.get('id')})"
+                    if user
+                    else f"请求成功 (UID: {data_obj.get('uid')})"
+                )
+                self.plugin_logger.info(
+                    f"WeiboMonitor: Cookie 已通过命令更换，{persistence_message}"
+                )
+                next_step = ""
+                if not self._get_all_subscribed_sessions():
+                    next_step = (
+                        "\n⚠️ 还需在希望接收微博的群聊或私聊执行 /weibo_umo 获取会话 ID，"
+                        "再打开本插件详情页的“订阅分组管理”添加并保存，"
+                        "否则自动检查的微博动态无人接收。"
                     )
-                    next_step = ""
-                    if not self._get_all_subscribed_sessions():
-                        next_step = (
-                            "\n⚠️ 还需在希望接收微博的群聊或私聊执行 /weibo_umo 获取会话 ID，"
-                            "再打开本插件详情页的“订阅分组管理”添加并保存，"
-                            "否则自动检查的微博动态无人接收。"
+                yield event.plain_result(
+                    f"✅ Cookie 更换成功！{user_info}\n{persistence_message}\n"
+                    f"{next_step}\n"
+                    f"🔄 正在重载插件..."
+                )
+                try:
+                    if hasattr(self.context, "star_loader") and hasattr(
+                        self.context.star_loader, "reload"
+                    ):
+                        self.context.star_loader.reload(
+                            "astrbot_plugin_weibo_monitor"
                         )
-                    yield event.plain_result(
-                        f"✅ Cookie 更换成功！{user_info}\n{persistence_message}\n"
-                        f"{next_step}\n"
-                        f"🔄 正在重载插件..."
-                    )
-                    try:
-                        if hasattr(self.context, "star_loader") and hasattr(
-                            self.context.star_loader, "reload"
-                        ):
-                            self.context.star_loader.reload(
-                                "astrbot_plugin_weibo_monitor"
-                            )
-                        elif hasattr(self.context, "reload_plugin"):
-                            self.context.reload_plugin("astrbot_plugin_weibo_monitor")
-                        else:
-                            yield event.plain_result(
-                                "⚠️ 无法自动重载插件，请手动在 WebUI 插件管理中点击「重载插件」，或重启 AstrBot。\n💡 新 Cookie 已生效，无需重载亦可正常使用。"
-                            )
-                    except Exception as reload_err:
-                        self.plugin_logger.warning(
-                            f"WeiboMonitor: 自动重载插件失败: {reload_err}"
-                        )
+                    elif hasattr(self.context, "reload_plugin"):
+                        self.context.reload_plugin("astrbot_plugin_weibo_monitor")
+                    else:
                         yield event.plain_result(
-                            "⚠️ 自动重载失败，请手动在 WebUI 插件管理中点击「重载插件」。\n💡 新 Cookie 已生效，无需重载亦可正常使用。"
+                            "⚠️ 无法自动重载插件，请手动在 WebUI 插件管理中点击「重载插件」，或重启 AstrBot。\n💡 新 Cookie 已生效，无需重载亦可正常使用。"
                         )
-                elif login is False:
-                    if not self._set_cookie_health_status("invalid"):
-                        self.plugin_logger.warning(
-                            "WeiboMonitor: Cookie 已验证失效，但健康状态未能落盘"
-                        )
-                    yield event.plain_result(
-                        "❌ Cookie 已更新但验证失败（接口返回 login: false），请检查 Cookie 是否正确。"
+                except Exception as reload_err:
+                    self.plugin_logger.warning(
+                        f"WeiboMonitor: 自动重载插件失败: {reload_err}"
                     )
-                else:
-                    if not self._set_cookie_health_status("error"):
-                        self.plugin_logger.warning(
-                            "WeiboMonitor: Cookie 验证状态未能落盘"
-                        )
                     yield event.plain_result(
-                        "⚠️ Cookie 已更新，但微博接口返回了无法识别的登录状态。新 Cookie 已保存，请稍后使用 /weibo_verify 重试。"
+                        "⚠️ 自动重载失败，请手动在 WebUI 插件管理中点击「重载插件」。\n💡 新 Cookie 已生效，无需重载亦可正常使用。"
                     )
             else:
                 if not self._set_cookie_health_status("error"):
@@ -3326,11 +3233,6 @@ class WeiboMonitor(Star):
                 "❌ 未配置微博 Cookie，无法执行微博动态检查。请先在插件设置中填写，或使用 /weibo_cookie。"
             )
             return
-        if self.cookie_health_status == "invalid":
-            yield event.plain_result(
-                "❌ 微博 Cookie 已失效。请更新 Cookie 后使用 /weibo_verify 验证。"
-            )
-            return
 
         yield event.plain_result("🔍 正在检查首个微博账号的最新动态...")
 
@@ -3383,11 +3285,6 @@ class WeiboMonitor(Star):
         if not self._get_cookie_value():
             yield event.plain_result(
                 "❌ 未配置微博 Cookie，无法执行微博动态检查。请先在插件设置中填写，或使用 /weibo_cookie。"
-            )
-            return
-        if self.cookie_health_status == "invalid":
-            yield event.plain_result(
-                "❌ 微博 Cookie 已失效。请更新 Cookie 后使用 /weibo_verify 验证。"
             )
             return
 
@@ -3779,22 +3676,13 @@ class WeiboMonitor(Star):
         )
 
     async def _check_cookie_health(self) -> str:
-        """检查 Cookie 健康状态，区分明确失效与临时验证错误。"""
+        """仅检查携带 Cookie 的请求状态，不依据 login/UID 判断登录。"""
         try:
             resp = await self.client.get(
                 WEIBO_COOKIE_REFRESH_URL, headers=self.get_headers()
             )
             if resp.status_code == 200:
-                data = resp.json()
-                login = login_data(data).get("login")
-                if login is True:
-                    return "valid"
-                if login is False:
-                    return "invalid"
-                self.plugin_logger.warning(
-                    "WeiboMonitor: Cookie 健康检查响应缺少明确的 login 布尔值"
-                )
-                return "error"
+                return "valid"
             self.plugin_logger.warning(
                 f"WeiboMonitor: Cookie 健康检查请求失败，状态码: {resp.status_code}"
             )
@@ -3955,94 +3843,47 @@ class WeiboMonitor(Star):
                     elif not self._get_all_subscribed_sessions():
                         self.plugin_logger.debug("WeiboMonitor: 未配置推送目标会话ID")
                     else:
-                        # 检查 Cookie 健康
-                        cookie_health_status = await self._check_cookie_health()
-                        self._set_cookie_health_status(cookie_health_status)
-                        if cookie_health_status != "valid":
-                            if cookie_health_status == "invalid":
-                                if not self.cookie_invalid_notified:
-                                    notify_targets = (
-                                        self._get_management_notification_targets(
-                                            fallback_to_subscriptions=True
-                                        )
-                                    )
-                                    (
-                                        successful,
-                                        failed,
-                                    ) = await self._send_text_to_targets(
-                                        notify_targets,
-                                        "⚠️ 微博监控 Cookie 失效提醒：已配置的微博 Cookie 验证为未登录或已失效，微博动态自动监控已暂停。\n请重新获取 Cookie，更新后使用 /weibo_verify 验证。",
-                                        reason="Cookie 失效通知",
-                                    )
-                                    if successful:
-                                        self.plugin_logger.warning(
-                                            f"WeiboMonitor: Cookie 已失效，已通知 {len(successful)}/{len(notify_targets)} 个目标"
-                                        )
-                                    elif notify_targets:
-                                        self.plugin_logger.warning(
-                                            "WeiboMonitor: Cookie 已失效，但通知未能发送到任何目标"
-                                        )
-                                    else:
-                                        self.plugin_logger.warning(
-                                            "WeiboMonitor: Cookie 已失效，但没有可用的管理通知目标"
-                                        )
-                                    if failed:
-                                        self.plugin_logger.warning(
-                                            f"WeiboMonitor: 有 {len(failed)} 个目标未收到 Cookie 失效通知"
-                                        )
-                                    self.cookie_invalid_notified = True
-                                self.plugin_logger.debug(
-                                    "WeiboMonitor: Cookie 已失效，跳过本轮抓取。"
-                                )
-                            else:
-                                self.plugin_logger.warning(
-                                    "WeiboMonitor: Cookie 暂时无法验证，跳过本轮抓取并等待下次重试。"
-                                )
-                        else:
-                            if self.cookie_invalid_notified:
-                                self.plugin_logger.info(
-                                    "WeiboMonitor: 检测到 Cookie 已更新为有效状态。"
-                                )
-                                self.cookie_invalid_notified = False  # 恢复通知标志
+                        # 直接使用 Cookie 抓取，不以配置接口的登录状态阻断监控。
+                        self.cookie_invalid_notified = False
+                        self._set_cookie_health_status(await self._check_cookie_health())
+                        self.plugin_logger.info(
+                            f"开始新一轮监控检查，共 {len(urls)} 个账号"
+                        )
+                        base_req_interval = self._get_config(
+                            "request_interval", DEFAULT_REQUEST_INTERVAL
+                        )
+                        req_jitter = self._get_config("request_interval_jitter", 0)
 
+                        cycle_success = True
+                        try:
+                            await self._process_monitor_cycle(
+                                urls, base_req_interval, req_jitter, msg_format
+                            )
+                        except Exception as cycle_error:
+                            self.plugin_logger.error(
+                                f"监控周期执行失败: {cycle_error}"
+                            )
+                            cycle_success = False
+
+                        if cycle_success:
+                            if self._consecutive_errors > 0:
+                                self._consecutive_errors = 0
+                                error_backoff = 60
+                                self.plugin_logger.info(
+                                    "WeiboMonitor: 连续错误已清除，恢复正常监控频率"
+                                )
                             self.plugin_logger.info(
-                                f"开始新一轮监控检查，共 {len(urls)} 个账号"
+                                f"本轮监控检查完成，下次检查将在约 {actual_interval} 分钟后"
                             )
-                            base_req_interval = self._get_config(
-                                "request_interval", DEFAULT_REQUEST_INTERVAL
+                        else:
+                            self._consecutive_errors += 1
+                            error_backoff = min(
+                                self._max_error_backoff,
+                                60 * (2 ** min(self._consecutive_errors, 5)),
                             )
-                            req_jitter = self._get_config("request_interval_jitter", 0)
-
-                            cycle_success = True
-                            try:
-                                await self._process_monitor_cycle(
-                                    urls, base_req_interval, req_jitter, msg_format
-                                )
-                            except Exception as cycle_error:
-                                self.plugin_logger.error(
-                                    f"监控周期执行失败: {cycle_error}"
-                                )
-                                cycle_success = False
-
-                            if cycle_success:
-                                if self._consecutive_errors > 0:
-                                    self._consecutive_errors = 0
-                                    error_backoff = 60
-                                    self.plugin_logger.info(
-                                        "WeiboMonitor: 连续错误已清除，恢复正常监控频率"
-                                    )
-                                self.plugin_logger.info(
-                                    f"本轮监控检查完成，下次检查将在约 {actual_interval} 分钟后"
-                                )
-                            else:
-                                self._consecutive_errors += 1
-                                error_backoff = min(
-                                    self._max_error_backoff,
-                                    60 * (2 ** min(self._consecutive_errors, 5)),
-                                )
-                                self.plugin_logger.warning(
-                                    f"连续错误次数: {self._consecutive_errors}，退避等待: {error_backoff}秒"
-                                )
+                            self.plugin_logger.warning(
+                                f"连续错误次数: {self._consecutive_errors}，退避等待: {error_backoff}秒"
+                            )
 
                     last_check_time = asyncio.get_event_loop().time()
                     self.next_push_time = (
