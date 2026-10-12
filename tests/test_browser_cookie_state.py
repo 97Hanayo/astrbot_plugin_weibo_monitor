@@ -34,6 +34,8 @@ class TestBrowserCookieState(unittest.IsolatedAsyncioTestCase):
         self.browser = Mock(new_context=AsyncMock(return_value=self.context), close=AsyncMock())
         runtime = AsyncMock()
         runtime.__aenter__.return_value = Mock()
+        runtime.start.return_value = Mock(stop=AsyncMock())
+        self.runtime = runtime
         module = types.ModuleType("playwright.async_api")
         module.async_playwright = Mock(return_value=runtime)
         return patch.dict(sys.modules, {"playwright.async_api": module})
@@ -165,6 +167,67 @@ class TestBrowserCookieState(unittest.IsolatedAsyncioTestCase):
                     await self.collect(path, return_url_pattern=r"^https://weibo\.com/$")
             self.context.cookies.assert_not_awaited()
             self.assertFalse(path.exists())
+
+
+    async def test_missing_playwright_reports_install_instruction(self):
+        with patch.dict(sys.modules, {"playwright.async_api": None}):
+            with self.assertRaisesRegex(playwright_cookies.BrowserUnavailableError, "安装 playwright"):
+                await playwright_cookies.collect_browser_cookies(
+                    cookies={"SUB": "old"}, refresh_urls=("https://weibo.com/",),
+                    allowed_domains=("weibo.com",), user_agent="test", timeout_ms=1000,
+                )
+
+    async def test_chromium_launch_error_reports_system_dependencies(self):
+        with self.setup_browser(), patch.object(playwright_cookies, "_launch_chromium",
+                new=AsyncMock(side_effect=RuntimeError("libnss3.so: cannot open shared object file"))):
+            with self.assertRaisesRegex(playwright_cookies.BrowserUnavailableError, "libnss3.so"):
+                await playwright_cookies.collect_browser_cookies(
+                    cookies={"SUB": "old"}, refresh_urls=("https://weibo.com/",),
+                    allowed_domains=("weibo.com",), user_agent="test", timeout_ms=1000,
+                )
+        self.browser.new_context.assert_not_awaited()
+
+
+    async def test_driver_start_failure_reports_actual_reason(self):
+        with self.setup_browser():
+            self.runtime.start.side_effect = RuntimeError("Connection closed while reading from the driver")
+            with self.assertRaisesRegex(playwright_cookies.BrowserUnavailableError, "Connection closed"):
+                await playwright_cookies.collect_browser_cookies(
+                    cookies={"SUB": "old"}, refresh_urls=("https://weibo.com/",),
+                    allowed_domains=("weibo.com",), user_agent="test", timeout_ms=1000,
+                )
+        self.browser.new_context.assert_not_awaited()
+
+    async def test_reuses_matching_resolver_chromium_before_installing(self):
+        import os
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ):
+            root = Path(directory)
+            owned = root / "astrbot_plugin_weibo_monitor" / "playwright-browsers"
+            relative = Path("chromium-123") / "chrome-linux" / "chrome"
+            shared = root / "astrbot_plugin_link_resolver" / "playwright-browsers" / relative
+            shared.parent.mkdir(parents=True)
+            shared.touch()
+            chromium = Mock(executable_path=str(owned / relative))
+            browser = Mock()
+            chromium.launch = AsyncMock(side_effect=[RuntimeError("missing owned browser"), browser])
+            runtime = Mock(chromium=chromium)
+            with patch.object(playwright_cookies, "_ensure_chromium_installed", new=AsyncMock()) as install:
+                result = await playwright_cookies._launch_chromium(runtime, owned)
+            self.assertIs(result, browser)
+            install.assert_not_awaited()
+            self.assertEqual(chromium.launch.call_args.kwargs["executable_path"], str(shared))
+
+    async def test_installs_owned_browser_when_resolver_revision_is_missing(self):
+        import os
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ):
+            owned = Path(directory) / "astrbot_plugin_weibo_monitor" / "playwright-browsers"
+            chromium = Mock(executable_path=str(owned / "chromium-123" / "chrome"))
+            browser = Mock()
+            chromium.launch = AsyncMock(side_effect=[RuntimeError("missing browser"), browser])
+            with patch.object(playwright_cookies, "_ensure_chromium_installed", new=AsyncMock(return_value=True)) as install:
+                await playwright_cookies._launch_chromium(Mock(chromium=chromium), owned)
+            install.assert_awaited_once_with(owned)
+            self.assertEqual(chromium.launch.await_count, 2)
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ from .weibo_cookies import (
     serialize_cookie_header,
     would_remove_login_cookie,
 )
-from .weibo_playwright import BrowserCookieRefreshError, collect_browser_cookies
+from .weibo_playwright import BrowserCookieRefreshError, BrowserUnavailableError, collect_browser_cookies
 from .weibo_session import WEIBO_LOGIN_URL, login_data
 
 # 常量定义
@@ -1205,6 +1205,11 @@ class WeiboMonitor(Star):
                 "请导入包含 weibo.com 与 login.sina.com.cn（tgc）的完整 Netscape Cookie 文件",
             )
             return
+        except BrowserUnavailableError as browser_error:
+            self._log_cookie_refresh(
+                "warning", "WeiboMonitor: 浏览器环境未就绪：%s；本轮降级到 HTTPX，未确认凭据续期",
+                str(browser_error),
+            )
         except Exception as browser_error:
             self._log_cookie_refresh(
                 "info", "WeiboMonitor: Playwright 保活不可用，降级到 HTTPX（%s）",

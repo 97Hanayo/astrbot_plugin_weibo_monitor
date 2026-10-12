@@ -47,7 +47,7 @@ namespace.update(List=List, Dict=Dict, Any=Any, Optional=Optional, Tuple=Tuple,
                  WEIBO_API_BASE="https://weibo.com/ajax/statuses/mymblog",
                  httpx=types.SimpleNamespace(Response=object), DEFAULT_TIMEOUT=20,
                  WEIBO_BROWSER_REFRESH_URLS=("https://weibo.com/",),
-                 collect_browser_cookies=AsyncMock(), BrowserCookieRefreshError=type("BrowserCookieRefreshError", (RuntimeError,), {}), AstrMessageEvent=object)
+                 collect_browser_cookies=AsyncMock(), BrowserUnavailableError=type("BrowserUnavailableError", (RuntimeError,), {}), BrowserCookieRefreshError=type("BrowserCookieRefreshError", (RuntimeError,), {}), AstrMessageEvent=object)
 ast_class = ast.ClassDef(name="PersistenceHarness", bases=[], keywords=[], body=selected, decorator_list=[])
 exec(compile(ast.fix_missing_locations(ast.Module(body=[ast_class], type_ignores=[])), "main.py", "exec"), namespace)
 PersistenceHarness = namespace["PersistenceHarness"]

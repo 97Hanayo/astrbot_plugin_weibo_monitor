@@ -66,6 +66,7 @@ async def _ensure_chromium_installed(browser_path: Path) -> bool:
             return False
         _INSTALL_ATTEMPTED = True
 
+        logger.info("WeiboMonitor: 自动安装 Playwright Chromium 到 %s", browser_path)
         env = os.environ.copy()
         env["PLAYWRIGHT_BROWSERS_PATH"] = str(browser_path)
         command = [sys.executable, "-m", "playwright", "install", "chromium"]
@@ -97,6 +98,20 @@ async def _ensure_chromium_installed(browser_path: Path) -> bool:
         return False
 
 
+def _reference_chromium_executable(playwright, browser_path: Path | None) -> Path | None:
+    """Reuse the resolver's matching browser revision without importing it."""
+    if browser_path is None:
+        return None
+    try:
+        expected = Path(playwright.chromium.executable_path)
+        relative = expected.resolve().relative_to(browser_path.resolve())
+    except (TypeError, ValueError, AttributeError):
+        return None
+    reference_cache = browser_path.parent.parent / "astrbot_plugin_link_resolver" / "playwright-browsers"
+    candidate = reference_cache / relative
+    return candidate if candidate.is_file() else None
+
+
 async def _launch_chromium(playwright, browser_path: Path | None):
     _configure_browser_path(browser_path)
     first_error: Exception | None = None
@@ -104,6 +119,17 @@ async def _launch_chromium(playwright, browser_path: Path | None):
         return await playwright.chromium.launch(headless=True)
     except Exception as exc:
         first_error = exc
+
+    reference_executable = _reference_chromium_executable(playwright, browser_path)
+    if reference_executable is not None:
+        try:
+            browser = await playwright.chromium.launch(
+                headless=True, executable_path=str(reference_executable),
+            )
+            logger.info("WeiboMonitor: 复用 link_resolver 已安装的 Chromium: %s", reference_executable)
+            return browser
+        except Exception as exc:
+            first_error = exc
 
     if browser_path is not None and await _ensure_chromium_installed(browser_path):
         try:
@@ -125,6 +151,10 @@ async def _launch_chromium(playwright, browser_path: Path | None):
     if first_error is not None:
         raise first_error
     raise RuntimeError("Chromium launch failed")
+
+
+class BrowserUnavailableError(RuntimeError):
+    """Browser setup failed before importing any account credentials."""
 
 
 class BrowserCookieRefreshError(RuntimeError):
@@ -184,12 +214,36 @@ async def collect_browser_cookies(
 
     try:
         from playwright.async_api import async_playwright
+    except ModuleNotFoundError as exc:
+        raise BrowserUnavailableError(
+            f"AstrBot 当前 Python 环境缺少 Playwright 依赖（{exc.name}）；"
+            "请在运行 AstrBot 的容器/虚拟环境内安装 playwright，仅重载插件不会补装依赖"
+        ) from exc
     except Exception as exc:
-        raise RuntimeError("Playwright is unavailable") from exc
+        raise BrowserUnavailableError(
+            f"Playwright 导入失败（{type(exc).__name__}）；请检查当前 Python 环境的 playwright 安装"
+        ) from exc
 
     _configure_browser_path(browser_path)
-    async with async_playwright() as playwright:
-        browser = await _launch_chromium(playwright, browser_path)
+    manager = async_playwright()
+    try:
+        playwright = await manager.start()
+    except Exception as exc:
+        detail = " ".join(str(exc).split())[:1200]
+        raise BrowserUnavailableError(
+            f"Playwright 驱动启动失败（{type(exc).__name__}）：{detail}"
+        ) from exc
+    try:
+        try:
+            browser = await _launch_chromium(playwright, browser_path)
+        except Exception as exc:
+            # Launch errors occur before cookie import; they can safely explain
+            # missing executables, shared libraries or unsupported sandboxing.
+            detail = " ".join(str(exc).split())[:1200]
+            raise BrowserUnavailableError(
+                f"Chromium 启动失败（{type(exc).__name__}）：{detail}；"
+                "Docker/Linux 请安装 Chromium 及系统依赖（python -m playwright install --with-deps chromium）"
+            ) from exc
         try:
             context_options = {
                 "viewport": dict(viewport or {"width": 1280, "height": 900}),
@@ -302,6 +356,8 @@ async def collect_browser_cookies(
                 await context.close()
         finally:
             await browser.close()
+    finally:
+        await playwright.stop()
 
 
 __all__ = ["collect_browser_cookies"]

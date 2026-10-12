@@ -37,8 +37,16 @@
    插件会自动安装 `requirements.txt` 中的依赖。如果手动安装，请在服务器环境下运行：
    
    ```bash
-   pip install httpx beautifulsoup4
+   python -m pip install -r requirements.txt
    ```
+
+   Playwright 的 Python 包与 Chromium 是两项独立依赖。更新旧插件后，若立即提示浏览器不可用，请在 **AstrBot 实际使用的 Python 环境**补装 `playwright`；Docker 部署应在运行 AstrBot 的容器内操作。Linux/Docker 还需安装 Chromium 及其系统依赖：
+
+   ```bash
+   python -m playwright install --with-deps chromium
+   ```
+
+   插件会优先复用相邻 `astrbot_plugin_link_resolver` 数据目录中版本匹配的 Chromium，未找到时自动下载至本插件的 `playwright-browsers` 目录；缺少 Python 包时无法执行下载，缺少 Linux 系统库时仅下载也不能启动。容器重建会丢失临时安装的依赖，长期使用请将安装步骤加入自定义镜像，并使用持久目录保存浏览器。
 
 2. **先配置 AstrBot 管理员**：
    在 AstrBot 管理面板的全局设置中填写“管理员 ID”（底层配置项为 `admins_id`），或直接在 AstrBot 全局配置文件中设置 `admins_id`。可在对应平台会话中通过 `/sid` 获取发送者 ID。
