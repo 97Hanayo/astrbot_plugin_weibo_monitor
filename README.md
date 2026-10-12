@@ -10,7 +10,7 @@
 - **定时监控**：自定义检查频率，支持间隔随机化避免被反爬。
 - **多用户支持**：可同时监控多个微博账号，支持URL、UID、用户名三种输入格式。
 - **精准推送**：仅推送最新更新，自动过滤置顶微博。
-- **Cookie 配置**：使用 `weibo.com` 桌面端 Cookie，支持配置项或插件数据目录 `cookies/weibo_cookies.txt`，兼容请求头与 Netscape 格式；Playwright 保活只保存桌面端 Cookie，不可用时降级请求 `/ajax/config/get_config`。
+- **Cookie 配置**：使用 `weibo.com` 桌面端 Cookie，支持配置项或插件数据目录 `cookies/weibo_cookies.txt`，兼容请求头与 Netscape 格式；Playwright 保活按域名导入微博及新浪 SSO Cookie，并保存跨域浏览器会话；浏览器不可用时降级请求 `/ajax/config/get_config`。
 - **灵活过滤**：支持屏蔽词过滤、白名单关键词过滤，可选择是否推送原创/转发微博。
 - **消息自定义**：支持自定义推送消息格式，满足不同需求。
 - **配置导入导出**：支持配置的导入导出，方便迁移和备份。
@@ -55,7 +55,7 @@
    机器人会返回当前会话的 ID，请记录下来。
 
 4. **配置插件**：
-   在 AstrBot 管理面板 -> 插件设置 -> `weibo_monitor` 中，按卡片配置 Cookie、监控频率、微博推送内容、图片与视频等项目。也可将 Cookie 保存到插件数据目录的 `cookies/weibo_cookies.txt`。后台手动更新的 Cookie 会同步到该文件；后台配置未变时，重载会保留文件中已续期的 Cookie。
+   在 AstrBot 管理面板 -> 插件设置 -> `weibo_monitor` 中，按卡片配置 Cookie、监控频率、微博推送内容、图片与视频等项目。也可将 Cookie 保存到插件数据目录的 `cookies/weibo_cookies.txt`。后台手动更新的完整 Cookie（含域名和新浪 SSO 条目）会同步到该文件；后台配置未变时，重载会保留文件中已续期的 Cookie。
 
 5. **配置监控与推送目标**：
    打开本插件详情页的 **订阅分组管理** Page：
@@ -321,10 +321,10 @@ group_fans_C: 2534531481, 5310078607, https://weibo.com/n/某明星
 ### Cookie 注意事项
 
 - Cookie具有有效期，失效后需要重新获取
-- `weibo_cookies.txt` 支持浏览器导出的 Netscape 格式和 `name=value; ...` 请求头格式；Netscape 文件只采用 `weibo.com` / `.weibo.com` 域记录，排除 `weibo.cn` 和其他子域的同名 Cookie
-- 插件默认每 12 小时用 Playwright 加载微博桌面端页面并原子回写 Cookie 文件；不可用时降级请求桌面端 `/ajax/config/get_config`，可在“微博账号与认证”中关闭或调整间隔
+- `weibo_cookies.txt` 支持 Netscape 格式和 `name=value; ...` 请求头格式。自动恢复登录时，请将 `weibo.com` 与 `login.sina.com.cn` 导出的完整 Netscape 内容一起填入现有 Cookie 配置，保留 `.login.sina.com.cn` 的 `tgc` 等专属字段、域名、路径及有效期；只有 `www.sina.com.cn` 的导出可能不够。后台把换行或制表符压成空格时，插件会恢复完整记录。微博 API 请求头只使用桌面端根路径 Cookie，新浪凭据只用于浏览器 SSO 跳转。
+- 插件默认每 12 小时用 Playwright 加载微博首页，允许新浪 SSO 下发 ticket 并通过微博跨域登录返回首页，之后保存服务端实际更新的完整 Cookie。浏览器会话（含跨域 Cookie 和 localStorage）原子保存至 `cookies/weibo_cookies.browser.json`，重载后复用；手动替换凭据时会重新导入。浏览器不可用时降级到 `/ajax/config/get_config`；浏览器停在登录页、跳转未完成或登录凭据被删除时保留原值，可在“微博账号与认证”中关闭或调整间隔。
 - 配置 Cookie 后直接携带其值抓取；不依据配置接口的 `login` 或 UID 字段暂停监控，检查请求失败也不会阻止动态抓取
-- 自动保活默认每 12 小时执行，允许更新 `SUB`、`SUBP`、`WBPSESS` 等服务端凭据并写回文件，不要求登录验证或 UID 一致；仍拒绝清空现有登录凭据的更新，刷新期间手动更换 Cookie 时丢弃旧会话结果
+- 自动保活允许更新 `SUB`、`SUBP`、`WBPSESS` 等服务端凭据，不要求 UID 一致。HTTP 保活拒绝非成功响应及明确的 `login=false`；浏览器保活要求返回首页且保留已有登录字段。刷新期间手动更换完整 Cookie（包括仅更换新浪凭据）时丢弃旧会话结果。
 - AstrBot 的 WebUI 平台日志会以 INFO 级别记录保活开始、浏览器降级与已保存的更新字段名，不记录 Cookie 值。访问成功但没有新值不代表登录凭据已延长有效期；服务端已注销的会话需要重新登录获取 Cookie
 - 服务端若不续期或主动使登录失效，仍需重新获取 Cookie
 - 请勿在多设备同时登录同一账号，可能导致Cookie失效

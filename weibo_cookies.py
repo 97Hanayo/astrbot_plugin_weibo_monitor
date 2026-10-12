@@ -9,7 +9,7 @@ from email.utils import parsedate_to_datetime
 from http.cookies import SimpleCookie
 from pathlib import Path
 from time import time
-from typing import Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, Tuple
 
 
 COOKIE_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
@@ -36,13 +36,66 @@ def _is_safe_cookie_value(value: str) -> bool:
     )
 
 
+def normalize_cookie_source(raw: str | None) -> str:
+    """Recover Netscape records flattened by a single-line config input."""
+    text = str(raw or '').lstrip('\ufeff').strip()
+    candidate = text.replace('\\r\\n', '\n').replace('\\n', '\n').replace('\\t', '\t')
+    record = '(?:#HttpOnly_)?\\.?[A-Za-z0-9.-]+\\s+(?:TRUE|FALSE)\\s+/\\S*\\s+(?:TRUE|FALSE)\\s+\\d+\\s+[^\\s=;]+\\s+'
+    if not re.search('(?<!\\S)' + record, candidate):
+        return text
+    candidate = re.sub('\\s+(?=' + record + ')', '\n', candidate)
+    lines = []
+    for line in candidate.splitlines():
+        line = line.strip()
+        if re.match(record, line):
+            line = '\t'.join(re.split('\\s+', line, maxsplit=6))
+        lines.append(line)
+    return '\n'.join(lines)
+
+def parse_browser_cookie_source(raw: str | None) -> list[dict[str, Any]]:
+    """Keep SSO cookies scoped to their exported domains and paths.
+
+        Only the desktop cookies go into API headers. Sina cookies are used
+        by Chromium on the normal first-party SSO redirects, never copied to
+        the Weibo domain or manufactured from an expired desktop session.
+        """
+    seeds: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for line in normalize_cookie_source(raw).splitlines():
+        line = line.strip()
+        http_only = line.startswith('#HttpOnly_')
+        if http_only:
+            line = line.removeprefix('#HttpOnly_')
+        elif line.startswith('#'):
+            continue
+        parts = line.split('\t')
+        if len(parts) < 7:
+            continue
+        domain, _, path, secure, expiry, name, value = parts[:7]
+        domain = domain.strip().lower()
+        if domain.lstrip('.') not in {'weibo.com', 'www.weibo.com', 'passport.weibo.com', 'sina.com.cn', 'login.sina.com.cn'}:
+            continue
+        name, value = (name.strip(), value.strip())
+        if not (COOKIE_NAME_RE.fullmatch(name) and _is_safe_cookie_value(value)) or not path.startswith('/'):
+            continue
+        try:
+            expires = int(expiry)
+        except ValueError:
+            continue
+        seed = {'name': name, 'value': value, 'domain': domain, 'path': path, 'secure': secure.upper() == 'TRUE', 'httpOnly': http_only}
+        if expires > 0:
+            seed['expires'] = expires
+        seeds[domain, path, name] = seed
+    return list(seeds.values())
+
 def parse_cookie_text(text: str) -> Dict[str, str]:
     """解析 Cookie 请求头或 Netscape cookies.txt 内容。"""
-    raw_text = str(text or "").lstrip("\ufeff").strip()
+    raw_text = normalize_cookie_source(text)
     if not raw_text:
         return {}
 
     netscape_cookies: Dict[str, str] = {}
+    has_netscape_records = False
+    cookie_priorities = {}
     for original_line in raw_text.splitlines():
         line = original_line.strip()
         if line.startswith("#HttpOnly_"):
@@ -54,19 +107,24 @@ def parse_cookie_text(text: str) -> Dict[str, str]:
             fields = line.split(None, 6)
         if len(fields) != 7:
             continue
+        has_netscape_records = True
         domain, _subdomains, _path, _secure, _expires, name, value = fields
         name = name.strip()
         value = value.strip()
         normalized_domain = domain.strip().lower().rstrip(".").lstrip(".")
         if (
             is_desktop_weibo_domain(normalized_domain)
+            and _path == "/"
             and COOKIE_NAME_RE.fullmatch(name)
             and _is_safe_cookie_value(value)
         ):
-            netscape_cookies[name] = value
+            priority = 0 if domain.startswith(".") else 1
+            if priority >= cookie_priorities.get(name, -1):
+                netscape_cookies[name] = value
+                cookie_priorities[name] = priority
 
     # 避免把 Netscape 文件整行再次误当成 HTTP 请求头。
-    if netscape_cookies:
+    if has_netscape_records:
         return netscape_cookies
 
     header_cookies: Dict[str, str] = {}
@@ -205,12 +263,12 @@ class WeiboCookieFile:
 
     def load(self) -> str:
         try:
-            return normalize_cookie_text(self.path.read_text(encoding="utf-8-sig"))
+            return normalize_cookie_source(self.path.read_text(encoding="utf-8-sig"))
         except (FileNotFoundError, OSError, UnicodeError):
             return ""
 
     def save(self, cookie_text: str) -> bool:
-        normalized = normalize_cookie_text(cookie_text)
+        normalized = normalize_cookie_source(cookie_text)
         if not normalized:
             return False
         temporary_path = None
@@ -239,3 +297,45 @@ class WeiboCookieFile:
                 except OSError:
                     pass
             return False
+
+
+def serialize_scoped_cookies(cookies):
+    lines = ["# Netscape HTTP Cookie File"]
+    for cookie in cookies:
+        domain = cookie["domain"]
+        lines.append("\t".join((
+            ("#HttpOnly_" if cookie.get("httpOnly") else "") + domain,
+            "TRUE" if domain.startswith(".") else "FALSE", cookie.get("path", "/"),
+            "TRUE" if cookie.get("secure") else "FALSE",
+            str(max(0, int(cookie.get("expires", 0)))), cookie["name"], cookie["value"],
+        )))
+    return "\n".join(lines)
+
+
+def update_cookie_source(source, header, browser_cookies=None):
+    """Keep SSO scope while replacing only the desktop request cookies."""
+    seeds = parse_browser_cookie_source(source)
+    if browser_cookies is not None:
+        return serialize_scoped_cookies(browser_cookies)
+    if not seeds:
+        return header
+    retained = [c for c in seeds if not is_desktop_weibo_domain(c["domain"])]
+    retained.extend({"name": name, "value": value, "domain": ".weibo.com", "path": "/", "secure": True}
+                    for name, value in parse_cookie_text(header).items())
+    return serialize_scoped_cookies(retained)
+
+
+def atomic_write_cookie_text(path, text):
+    """Atomically persist browser state without treating JSON as cookies."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(text)
+        os.replace(temporary_path, path)
+        os.chmod(path, 0o600)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)

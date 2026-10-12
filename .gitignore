@@ -175,4 +175,6 @@ Thumbs.db
 *.tmp
 *.bak
 CODE_REVIEW_REPORT.md
-/tests
+/tests/*
+!/tests/test_weibo_session.py
+!/tests/test_browser_cookie_state.py

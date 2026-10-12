@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+from typing import Callable
+from .weibo_cookies import is_desktop_weibo_domain, atomic_write_cookie_text
+
 import asyncio
 import logging
 import os
@@ -121,67 +127,116 @@ async def _launch_chromium(playwright, browser_path: Path | None):
     raise RuntimeError("Chromium launch failed")
 
 
+class BrowserCookieRefreshError(RuntimeError):
+    """A browser ran, but the page did not complete the expected recovery flow."""
+
+
 async def collect_browser_cookies(
     *,
     cookies: Mapping[str, str],
     refresh_urls: Sequence[str],
     allowed_domains: Iterable[str],
-    user_agent: str,
+    user_agent: str | None,
     timeout_ms: int,
     browser_path: Path | None = None,
+    viewport: Mapping[str, int] | None = None,
+    cookie_domain: str | None = None,
+    state_path: Path | None = None,
+    session_cookie_names: Sequence[str] = (),
+    return_url_pattern: str | None = None,
+    on_navigation: Callable[[str], None] | None = None,
+    scoped_cookies: Sequence[Mapping[str, Any]] | None = None,
+    on_cookie_state: Callable[[list[dict[str, Any]], bool], None] | None = None,
 ) -> list[dict[str, Any]]:
-    """Load seeded cookies in Chromium and return the effective Cookie jar."""
+    """Load cookies in Chromium and return the final same-site Cookie jar.
+
+    Playwright exposes the browser's effective Cookie jar, which includes both
+    HTTP ``Set-Cookie`` updates and cookies written by page scripts. Values are
+    returned to the caller so each platform can apply its login-cookie safety
+    rules before persistence.
+    """
     if not cookies or not refresh_urls:
         return []
+
+    def fingerprint(values: Mapping[str, str]) -> str:
+        selected = dict(values)
+        return hashlib.sha256(json.dumps(selected, sort_keys=True).encode()).hexdigest()
+
+    input_digest = fingerprint(cookies)
+    source_digest = (
+        hashlib.sha256(json.dumps([c for c in scoped_cookies if not is_desktop_weibo_domain(c.get("domain", ""))], sort_keys=True).encode()).hexdigest()
+        if scoped_cookies else None
+    )
+    saved_state = None
+    if state_path is not None:
+        try:
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            if input_digest in (saved.get("input_digest"), saved.get("output_digest")):
+                candidate_state = saved.get("storage_state")
+                # A new SSO export must replace stale saved state even when
+                # the desktop login fields happen to be unchanged.
+                if isinstance(candidate_state, dict) and (
+                    not scoped_cookies or source_digest in (saved.get("source_digest"), saved.get("output_source_digest"))
+                ):
+                    saved_state = candidate_state
+        except (OSError, ValueError, AttributeError):
+            pass
 
     try:
         from playwright.async_api import async_playwright
     except Exception as exc:
         raise RuntimeError("Playwright is unavailable") from exc
 
+    _configure_browser_path(browser_path)
     async with async_playwright() as playwright:
         browser = await _launch_chromium(playwright, browser_path)
         try:
-            context = await browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                user_agent=user_agent,
-                locale="zh-CN",
-                extra_http_headers={
-                    "Accept": "application/json, text/plain, */*",
-                    "X-Requested-With": "XMLHttpRequest",
-                },
-            )
+            context_options = {
+                "viewport": dict(viewport or {"width": 1280, "height": 900}),
+                "locale": "zh-CN",
+            }
+            if user_agent:
+                context_options["user_agent"] = user_agent
+            if saved_state is not None:
+                context_options["storage_state"] = saved_state
+            context = await browser.new_context(**context_options)
             try:
-                seed_cookies = []
-                for refresh_url in refresh_urls:
-                    host = (urlparse(refresh_url).hostname or "").lower()
-                    if host != "weibo.com":
-                        continue
-                    root_domain = ".weibo.com"
-                    seed_cookies.extend(
-                        {
-                            "name": name,
-                            "value": value,
-                            "domain": root_domain,
-                            "path": "/",
-                            "secure": True,
-                        }
-                        for name, value in cookies.items()
-                        if name and value
-                    )
-                if seed_cookies:
+                seed_cookies = list(scoped_cookies) if scoped_cookies else [
+                    {
+                        "name": name,
+                        "value": value,
+                        **({"domain": cookie_domain, "path": "/", "secure": True}
+                           if cookie_domain else {"url": refresh_url}),
+                    }
+                    for refresh_url in (refresh_urls[:1] if cookie_domain else refresh_urls)
+                    for name, value in cookies.items()
+                    if name and value
+                ]
+                if seed_cookies and saved_state is None:
                     await context.add_cookies(seed_cookies)
+                if on_cookie_state is not None:
+                    on_cookie_state(await context.cookies(), saved_state is not None)
 
+                loaded = False
                 for refresh_url in refresh_urls:
                     page = await context.new_page()
+                    if on_navigation is not None:
+                        def navigated(frame):
+                            if frame == page.main_frame:
+                                on_navigation(frame.url)
+                        page.on("framenavigated", navigated)
                     try:
                         try:
-                            await page.goto(
+                            response = await page.goto(
                                 refresh_url,
                                 wait_until="domcontentloaded",
                                 timeout=max(1000, int(timeout_ms)),
                             )
+                            if state_path is not None and response is not None and response.status >= 400:
+                                raise RuntimeError("Browser keepalive page failed")
                         except Exception:
+                            # Continue with another first-party refresh URL if
+                            # one site variant is blocked or times out.
                             pass
                         else:
                             try:
@@ -190,15 +245,59 @@ async def collect_browser_cookies(
                                     timeout=min(max(1000, int(timeout_ms)), 8000),
                                 )
                             except Exception:
+                                # Trackers and long-polling requests can prevent
+                                # networkidle without affecting Cookie updates.
                                 pass
+                            if return_url_pattern is not None:
+                                try:
+                                    await page.wait_for_url(
+                                        re.compile(return_url_pattern),
+                                        wait_until="domcontentloaded",
+                                        timeout=max(1000, int(timeout_ms)),
+                                    )
+                                except Exception as exc:
+                                    raise BrowserCookieRefreshError(
+                                        "Browser did not return to the expected homepage"
+                                    ) from exc
+                            loaded = True
                     finally:
                         await page.close()
 
-                return [
+                if (state_path is not None or return_url_pattern is not None) and not loaded:
+                    raise BrowserCookieRefreshError("No browser keepalive page loaded")
+                allowed = tuple(allowed_domains) + ("sina.com.cn",)
+                collected = (
+                    await context.cookies()
+                )
+                browser_cookies = [
                     cookie
-                    for cookie in await context.cookies(list(refresh_urls))
-                    if _host_matches(cookie.get("domain", ""), allowed_domains)
+                    for cookie in collected
+                    if _host_matches(str(cookie.get("domain") or ""), allowed)
                 ]
+                if state_path is not None:
+                    effective = {
+                        item["name"]: item["value"]
+                        for item in sorted(browser_cookies, key=lambda c: c.get("domain") != ".weibo.com")
+                        if is_desktop_weibo_domain(item.get("domain", "")) and item.get("path", "/") == "/"
+                    }
+                    if any(
+                        cookies.get(name) and not effective.get(name)
+                        for name in session_cookie_names
+                    ):
+                        raise BrowserCookieRefreshError("Browser keepalive removed login cookies")
+                    # Preserve scoped cookies and local storage, including SSO
+                    # state from redirects. Never flatten that state into headers.
+                    atomic_write_cookie_text(state_path, json.dumps({
+                        "input_digest": input_digest,
+                        "output_digest": fingerprint(effective),
+                        "source_digest": source_digest,
+                        "output_source_digest": hashlib.sha256(json.dumps([
+                            {k: (int(c[k]) if k == "expires" else c[k]) for k in ("name", "value", "domain", "path", "secure", "httpOnly", "expires") if k in c and (k != "expires" or c[k] > 0)}
+                            for c in browser_cookies if not is_desktop_weibo_domain(c.get("domain", ""))
+                        ], sort_keys=True).encode()).hexdigest(),
+                        "storage_state": await context.storage_state(),
+                    }))
+                return browser_cookies
             finally:
                 await context.close()
         finally:
