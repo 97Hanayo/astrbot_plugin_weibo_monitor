@@ -1187,7 +1187,7 @@ class WeiboMonitor(Star):
                 on_cookie_state=self._log_browser_cookie_state,
             )
             if not browser_cookies:
-                raise RuntimeError("Playwright 未返回微博 Cookie")
+                raise BrowserUnavailableError("Playwright 未返回微博 Cookie；请检查传入的桌面端 Cookie 是否解析为空")
             if source != self._get_cookie_source():
                 self._log_cookie_refresh("info", "WeiboMonitor: 完整 Cookie 配置已变更，丢弃旧会话结果")
                 return

@@ -107,8 +107,18 @@ def parse_cookie_text(text: str) -> Dict[str, str]:
             fields = line.split(None, 6)
         if len(fields) != 7:
             continue
-        has_netscape_records = True
         domain, _subdomains, _path, _secure, _expires, name, value = fields
+        # A long Cookie header also splits into seven whitespace segments.
+        # Only the Netscape flag/path/expiry fields identify a file record.
+        if not (
+            re.fullmatch(r"\.?[A-Za-z0-9.-]+", domain)
+            and _subdomains in {"TRUE", "FALSE"}
+            and _path.startswith("/")
+            and _secure in {"TRUE", "FALSE"}
+            and _expires.isdigit()
+        ):
+            continue
+        has_netscape_records = True
         name = name.strip()
         value = value.strip()
         normalized_domain = domain.strip().lower().rstrip(".").lstrip(".")

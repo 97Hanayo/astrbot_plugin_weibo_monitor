@@ -330,5 +330,40 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cookies.parse_browser_cookie_source(plugin.cookie)[1]["value"], "new-sso")
 
 
+    def test_long_header_round_trip_preserves_all_fields(self):
+        values = {"SUB": "one", "SUBP": "two", "ALF": "three", "WBPSESS": "four",
+                  "SINAGLOBAL": "five", "ULV": "six", "XSRF-TOKEN": "seven", "_s_tentry": "eight=tail"}
+        header = cookies.serialize_cookie_header(values)
+        for text in (header, "Cookie: " + header):
+            self.assertEqual(cookies.parse_cookie_text(text), values)
+            self.assertEqual(cookies.normalize_cookie_text(cookies.normalize_cookie_text(text)), header)
+        netscape = "\n".join(f".weibo.com\tTRUE\t/\tTRUE\t0\t{name}\t{value}" for name, value in values.items())
+        self.assertEqual(cookies.parse_cookie_text(cookies.normalize_cookie_text(netscape)), values)
+
+    async def test_full_plugin_keepalive_passes_large_desktop_header_and_scoped_sso(self):
+        plugin = persistence_harness()
+        values = {f"C{i}": f"value{i}" for i in range(9)}
+        values.update(SUB="old", SUBP="oldp", WBPSESS="oldw")
+        source = "\n".join(f".weibo.com\tTRUE\t/\tTRUE\t0\t{name}\t{value}" for name, value in values.items())
+        source += "\n#HttpOnly_.login.sina.com.cn\tTRUE\t/\tTRUE\t0\ttgc\tsso"
+        plugin.cookie = source
+        plugin._get_cookie_value = lambda: cookies.normalize_cookie_text(plugin.cookie)
+        plugin._last_cookie_refresh_at = 0
+        plugin.data_dir = ROOT
+        plugin.client = types.SimpleNamespace(get=AsyncMock())
+        jar = cookies.parse_browser_cookie_source(source)
+        jar[0]["value"] = "renewed"
+        browser = namespace["collect_browser_cookies"]
+        browser.reset_mock()
+        browser.side_effect = None
+        browser.return_value = jar
+        await plugin._refresh_weibo_cookie_session()
+        self.assertEqual(browser.call_args.kwargs["cookies"], values)
+        self.assertEqual(browser.call_args.kwargs["scoped_cookies"][-1]["name"], "tgc")
+        plugin.client.get.assert_not_awaited()
+        plugin.cookie_file.save.assert_called_once()
+        self.assertEqual(cookies.parse_cookie_text(plugin.cookie)["C0"], "renewed")
+
+
 if __name__ == "__main__":
     unittest.main()
