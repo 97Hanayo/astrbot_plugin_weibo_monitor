@@ -178,3 +178,4 @@ CODE_REVIEW_REPORT.md
 /tests/*
 !/tests/test_weibo_session.py
 !/tests/test_browser_cookie_state.py
+!/tests/test_retweet_delivery.py

@@ -31,7 +31,7 @@ selected = [n for n in plugin_class.body if isinstance(n, (ast.FunctionDef, ast.
     "_capture_playwright_cookie_updates", "_get_cookie_source", "_log_cookie_navigation", "_log_browser_cookie_state", "_persist_refreshed_cookie", "_cookie_fingerprint", "_log_cookie_refresh",
     "_initialize_cookie_value", "_capture_weibo_cookie_updates", "_refresh_weibo_cookie_session",
     "_fetch_weibo_cards", "_prepare_desktop_mblog", "_fetch_single_weibo",
-    "_extract_image_urls", "_extract_video_info", "_extract_valid_mblogs",
+    "_extract_image_urls", "_extract_video_info", "_extract_valid_mblogs", "_extract_post_content",
     "get_headers", "_check_cookie_health", "weibo_verify",
 }]
 for method in selected:

@@ -562,7 +562,7 @@ class WeiboMonitor(Star):
     def _get_delivery_options(
         self, session_id: str, legacy_all: bool = False
     ) -> Dict[str, bool]:
-        """读取会话的热搜和总结接收设置；旧版 * 配置保持原有全选行为。"""
+        """读取会话的附加推送设置；转发内容默认包含，旧版 * 保留热搜和总结。"""
         options = self.config.get("subscription_delivery_options", {})
         session_options = (
             options.get(session_id, {}) if isinstance(options, dict) else {}
@@ -570,6 +570,7 @@ class WeiboMonitor(Star):
         if not isinstance(session_options, dict):
             session_options = {}
         return {
+            "include_retweet": session_options.get("include_retweet", True) is True,
             "receive_hotsearch": session_options.get("receive_hotsearch", legacy_all)
             is True,
             "receive_daily_summary": session_options.get(
@@ -1679,6 +1680,7 @@ class WeiboMonitor(Star):
             raw_uids = row.get("uids", [])
             receive_hotsearch = row.get("receive_hotsearch")
             receive_daily_summary = row.get("receive_daily_summary")
+            include_retweet = row.get("include_retweet", True)
             if not session_id:
                 return error_response(
                     f"第 {index} 行的会话 ID 不能为空", status_code=400
@@ -1697,7 +1699,10 @@ class WeiboMonitor(Star):
                 return error_response(
                     f"第 {index} 行的热搜或每日总结开关无效", status_code=400
                 )
+            if not isinstance(include_retweet, bool):
+                return error_response(f"第 {index} 行的转发开关无效", status_code=400)
             delivery_options[session_id] = {
+                "include_retweet": include_retweet,
                 "receive_hotsearch": receive_hotsearch,
                 "receive_daily_summary": receive_daily_summary,
             }
@@ -2341,17 +2346,9 @@ class WeiboMonitor(Star):
     def _extract_video_info(self, mblog: dict) -> Optional[dict]:
         """从微博博文数据中提取视频信息。
         若 page_info.type == "video" 则返回包含 url、cover 等的字典，
-        否则返回 None。同时检查转发微博的视频。
+        否则返回 None。被转发微博的媒体单独提取，由会话设置决定是否发送。
         """
         page_info = mblog.get("page_info")
-        if not (
-            page_info
-            and isinstance(page_info, dict)
-            and page_info.get("type") == "video"
-        ):
-            retweet = mblog.get("retweeted_status")
-            if isinstance(retweet, dict):
-                page_info = retweet.get("page_info")
         if not (
             page_info
             and isinstance(page_info, dict)
@@ -2389,6 +2386,51 @@ class WeiboMonitor(Star):
             "duration": (page_info.get("media_info") or {}).get("duration"),
             "title": page_info.get("page_title"),
         }
+
+    def _extract_post_content(self, mblog: dict) -> Dict[str, Any]:
+        """保留各层转发内容，避免抓取时将不同会话的选择混在一起。"""
+        content = {
+            "text": self.clean_text(mblog.get("text") or mblog.get("text_raw", "")),
+            "image_urls": self._extract_image_urls(mblog),
+            "video_info": self._extract_video_info(mblog),
+        }
+        retweet = mblog.get("retweeted_status")
+        if isinstance(retweet, dict):
+            user = retweet.get("user") or {}
+            uid = user.get("idstr") or user.get("id")
+            bid = retweet.get("bid") or retweet.get("mblogid") or retweet.get("idstr") or retweet.get("id")
+            link = (
+                f"{WEIBO_WEB_BASE}/{uid}/{bid}" if uid and bid
+                else f"{WEIBO_WEB_BASE}/detail/{bid}" if bid else ""
+            )
+            content["retweeted_post"] = {
+                **self._extract_post_content(retweet),
+                "username": user.get("screen_name") or "未知用户",
+                "link": link,
+            }
+        return content
+
+    def _post_delivery_variant(self, post: dict, include_retweet: bool) -> dict:
+        """构造会话实际接收的内容，保留博主正文并按需附带完整转发链。"""
+        variant = dict(post)
+        variant.pop("retweeted_post", None)
+        images = list(post.get("image_urls") or [])
+        video_posts = [post] if post.get("video_info") else []
+        retweet = post.get("retweeted_post") if include_retweet else None
+        while isinstance(retweet, dict):
+            section = f"转发 @{retweet.get('username') or '未知用户'}：\n{retweet.get('text', '')}"
+            if retweet.get("link"):
+                section += f"\n原微博链接: {retweet['link']}"
+            variant["text"] = f"{variant.get('text', '')}\n\n{section}".strip()
+            images.extend(retweet.get("image_urls") or [])
+            if retweet.get("video_info"):
+                video_posts.append(retweet)
+            retweet = retweet.get("retweeted_post")
+        variant["image_urls"] = list(dict.fromkeys(images))
+        unique_videos = {item["video_info"]["url"]: item for item in video_posts}
+        variant["_video_posts"] = list(unique_videos.values())
+        variant["video_info"] = next(iter(unique_videos.values()))["video_info"] if unique_videos else None
+        return variant
 
     async def _download_image(self, url: str, save_name: str) -> Optional[str]:
         """下载图片到临时目录，返回本地文件路径"""
@@ -2544,6 +2586,42 @@ class WeiboMonitor(Star):
         skip_log: bool = False,
         failure_guidance: str = TARGET_ID_FAILURE_GUIDANCE,
     ) -> Dict[str, Any]:
+        """按会话转发开关分组发送，并合并正文确认结果供持久化队列重试。"""
+        groups: Dict[bool, List[str]] = {}
+        for target in dict.fromkeys(targets):
+            include = bool(post.get("retweeted_post")) and self._get_delivery_options(target)["include_retweet"]
+            groups.setdefault(include, []).append(target)
+        if not groups:
+            groups[False] = []
+        results = []
+        for include, group_targets in groups.items():
+            variant = self._post_delivery_variant(post, include)
+            results.append(await self._send_post_variant_to_targets(
+                variant, msg_format, group_targets, skip_log=True,
+                failure_guidance=failure_guidance,
+            ))
+        result = {}
+        for key, value in results[0].items():
+            values = [item[key] for item in results]
+            if isinstance(value, list):
+                result[key] = list(dict.fromkeys(target for items in values for target in items))
+            elif isinstance(value, bool):
+                result[key] = any(values)
+            else:
+                result[key] = max(values)
+        post["_video_sent"] = bool(result["successful_video_targets"])
+        if result["successful_text_targets"] and not skip_log:
+            self._log_to_daily_file(post, delivery_count=len(result["successful_text_targets"]))
+        return result
+
+    async def _send_post_variant_to_targets(
+        self,
+        post: dict,
+        msg_format: str,
+        targets: List[str],
+        skip_log: bool = False,
+        failure_guidance: str = TARGET_ID_FAILURE_GUIDANCE,
+    ) -> Dict[str, Any]:
         """发送单条微博到指定目标。
         文字与图片分别独立发送，解决飞书适配器图文混合消息文字丢失问题（统一应用于所有平台）。
         返回正文和媒体的结构化发送结果，供命令准确展示 X/Y。
@@ -2615,67 +2693,76 @@ class WeiboMonitor(Star):
         # 视频下载和推送
         video_enabled = self._get_config("enable_video_download", True)
         video_available = bool(post.get("video_info"))
-        video_path = None
-        video_download_failed = False
-        if video_enabled and video_available:
-            self.plugin_logger.info(
-                f"检测到视频微博，开始下载: {post.get('link', 'unknown')}"
-            )
-            try:
-                dl_timeout = self._get_config("video_download_timeout", 60)
-                if dl_timeout > 0:
-                    video_path = await asyncio.wait_for(
-                        self._download_post_video(post), timeout=dl_timeout
-                    )
-                else:
-                    video_path = await self._download_post_video(post)
-            except asyncio.TimeoutError:
-                self.plugin_logger.warning(
-                    f"视频下载超时（{dl_timeout}秒），已跳过: {post.get('link', 'unknown')}"
-                )
-                video_path = None
-                video_download_failed = True
-            except Exception as e:
-                self.plugin_logger.error(f"WeiboMonitor: 视频下载失败: {e}")
-                video_download_failed = True
-            if not video_path:
-                video_download_failed = True
         successful_video_targets = []
         video_failed_targets = []
         video_component_failed = False
-        if video_path:
-            send_timeout = self._get_config("video_send_timeout", 60)
-            try:
-                video_chain = MessageChain()
-                video_chain.chain.append(Comp.Video.fromFileSystem(path=video_path))
-            except Exception as e:
-                video_chain = None
-                video_component_failed = True
-                self.plugin_logger.error(f"WeiboMonitor: 构造视频消息失败: {e}")
-            for target in successful_text_targets:
-                if video_chain is None:
-                    break
+        video_download_failed = False
+        video_posts = post.get("_video_posts", [post] if video_available else [])
+        for video_post in video_posts:
+            video_path = None
+            if video_enabled and video_available:
+                self.plugin_logger.info(
+                    f"检测到视频微博，开始下载: {post.get('link', 'unknown')}"
+                )
                 try:
-                    if send_timeout > 0:
-                        result = await asyncio.wait_for(
-                            self.context.send_message(target, video_chain),
-                            timeout=send_timeout,
+                    dl_timeout = self._get_config("video_download_timeout", 60)
+                    if dl_timeout > 0:
+                        video_path = await asyncio.wait_for(
+                            self._download_post_video(video_post), timeout=dl_timeout
                         )
                     else:
-                        result = await self.context.send_message(target, video_chain)
-                    if result is False:
-                        raise RuntimeError("AstrBot 未找到匹配的消息平台")
-                    successful_video_targets.append(target)
+                        video_path = await self._download_post_video(video_post)
                 except asyncio.TimeoutError:
-                    video_failed_targets.append(target)
                     self.plugin_logger.warning(
-                        f"视频推送到 {target} 超时（{send_timeout}秒）"
+                        f"视频下载超时（{dl_timeout}秒），已跳过: {post.get('link', 'unknown')}"
                     )
+                    video_path = None
+                    video_download_failed = True
                 except Exception as e:
-                    video_failed_targets.append(target)
-                    self.plugin_logger.error(
-                        f"WeiboMonitor: 视频推送到 {target} 失败: {e}"
-                    )
+                    self.plugin_logger.error(f"WeiboMonitor: 视频下载失败: {e}")
+                    video_download_failed = True
+                if not video_path:
+                    video_download_failed = True
+                    video_failed_targets.extend(successful_text_targets)
+            if video_path:
+                send_timeout = self._get_config("video_send_timeout", 60)
+                try:
+                    video_chain = MessageChain()
+                    video_chain.chain.append(Comp.Video.fromFileSystem(path=video_path))
+                except Exception as e:
+                    video_chain = None
+                    video_component_failed = True
+                    video_failed_targets.extend(successful_text_targets)
+                    self.plugin_logger.error(f"WeiboMonitor: 构造视频消息失败: {e}")
+                for target in successful_text_targets:
+                    if video_chain is None:
+                        break
+                    try:
+                        if send_timeout > 0:
+                            result = await asyncio.wait_for(
+                                self.context.send_message(target, video_chain),
+                                timeout=send_timeout,
+                            )
+                        else:
+                            result = await self.context.send_message(target, video_chain)
+                        if result is False:
+                            raise RuntimeError("AstrBot 未找到匹配的消息平台")
+                        successful_video_targets.append(target)
+                    except asyncio.TimeoutError:
+                        video_failed_targets.append(target)
+                        self.plugin_logger.warning(
+                            f"视频推送到 {target} 超时（{send_timeout}秒）"
+                        )
+                    except Exception as e:
+                        video_failed_targets.append(target)
+                        self.plugin_logger.error(
+                            f"WeiboMonitor: 视频推送到 {target} 失败: {e}"
+                        )
+        successful_video_targets = [
+            target for target in dict.fromkeys(successful_video_targets)
+            if target not in video_failed_targets
+        ]
+        video_failed_targets = list(dict.fromkeys(video_failed_targets))
         post["_video_sent"] = bool(successful_video_targets)
 
         return {
@@ -2749,23 +2836,17 @@ class WeiboMonitor(Star):
                 (mblog.get("user") or {}).get("id", "")
             )
             username = (mblog.get("user") or {}).get("screen_name", "未知用户")
-            text = self.clean_text(mblog.get("text", ""))
             link = (
                 f"{WEIBO_WEB_BASE}/{uid}/{bid}"
                 if uid
                 else f"{WEIBO_WEB_BASE}/detail/{bid}"
             )
             created_at = self._parse_weibo_time(mblog.get("created_at", ""))
-            image_urls = self._extract_image_urls(mblog)
-            video_info = self._extract_video_info(mblog)
-
             return {
-                "text": text,
+                **self._extract_post_content(mblog),
                 "link": link,
                 "username": username,
                 "created_at": created_at,
-                "image_urls": image_urls,
-                "video_info": video_info,
             }
         except Exception as e:
             self.plugin_logger.error(f"抓取单条微博出错: {e}，bid: {bid}")
@@ -3664,7 +3745,7 @@ class WeiboMonitor(Star):
             )
             return
 
-        if not post.get("text") and not post.get("image_urls"):
+        if not any(post.get(key) for key in ("text", "image_urls", "video_info", "retweeted_post")):
             yield event.plain_result("❌ 该微博内容为空。")
             return
 
@@ -3689,7 +3770,7 @@ class WeiboMonitor(Star):
         actual_images = delivery["image_count"]
         image_info = f"，含 {actual_images} 张图片" if actual_images > 0 else ""
         video_info_text = ""
-        if post.get("video_info"):
+        if delivery.get("video_available"):
             if not delivery.get("video_enabled"):
                 video_info_text = "，视频发送未启用"
             else:
@@ -4491,7 +4572,6 @@ class WeiboMonitor(Star):
                         f"WeiboMonitor: 正在将 UID {uid} 的历史微博记录到日志..."
                     )
                     for mblog in reversed(valid_mblogs):  # 从旧到新记录
-                        text = self.clean_text(mblog.get("text", ""))
                         bid = mblog.get("bid")
                         if not bid:
                             continue
@@ -4500,12 +4580,10 @@ class WeiboMonitor(Star):
                         created_at = self._parse_weibo_time(created_at_raw)
 
                         post = {
-                            "text": text,
+                            **self._extract_post_content(mblog),
                             "link": link,
                             "username": username,
                             "created_at": created_at,
-                            "image_urls": self._extract_image_urls(mblog),
-                            "video_info": self._extract_video_info(mblog),
                         }
                         self._log_to_daily_file(post, record_type="initial_snapshot")
             else:
@@ -4573,19 +4651,14 @@ class WeiboMonitor(Star):
 
             created_at_raw = mblog.get("created_at")
             created_at = self._parse_weibo_time(created_at_raw)
-            image_urls = self._extract_image_urls(mblog)
-            video_info = self._extract_video_info(mblog)
-
             new_posts.append(
                 {
+                    **self._extract_post_content(mblog),
                     "_post_id": str(current_id),
                     "_uid": uid,
-                    "text": text,
                     "link": link,
                     "username": username,
                     "created_at": created_at,
-                    "image_urls": image_urls,
-                    "video_info": video_info,
                 }
             )
 

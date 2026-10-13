@@ -209,6 +209,7 @@ function addRow(data = {}) {
   const defaultDeliveries = row.querySelector(".mode").value === "all";
   row.querySelector(".receive-hotsearch").checked = data.receive_hotsearch ?? defaultDeliveries;
   row.querySelector(".receive-daily-summary").checked = data.receive_daily_summary ?? defaultDeliveries;
+  row.querySelector(".include-retweet").checked = data.include_retweet ?? true;
   row.querySelector(".mode").addEventListener("change", () => updateRowMode(row));
   row.querySelector(".remove").addEventListener("click", () => {
     row.remove();
@@ -226,6 +227,7 @@ function readRows() {
     uids: [...row.querySelectorAll(".uid-checklist input:checked")].map((input) => input.value),
     receive_hotsearch: row.querySelector(".receive-hotsearch").checked,
     receive_daily_summary: row.querySelector(".receive-daily-summary").checked,
+    include_retweet: row.querySelector(".include-retweet").checked,
   }));
 }
 
