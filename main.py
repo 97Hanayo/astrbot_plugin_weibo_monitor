@@ -33,6 +33,10 @@ from .weibo_cookies import (
 )
 from .weibo_playwright import BrowserCookieRefreshError, BrowserUnavailableError, collect_browser_cookies
 from .weibo_session import WEIBO_LOGIN_URL, login_data
+from .qq_video_relay import (
+    parse_qq_private_umo,
+    send_videos_to_private_relay,
+)
 
 # 常量定义
 DEFAULT_CHECK_INTERVAL = 10  # 默认检查间隔（分钟）
@@ -84,7 +88,7 @@ CONFIG_GROUPS = {
         "video_send_timeout",
         "temp_media_retention_minutes",
     ),
-    "delivery_settings": ("message_send_timeout",),
+    "delivery_settings": ("message_send_timeout", "video_relay_umo"),
     "filter_settings": ("filter_keywords", "whitelist_keywords"),
     "logging_settings": (
         "enable_plugin_log",
@@ -111,7 +115,7 @@ CONFIG_KEY_GROUPS = {
     "astrbot_plugin_weibo_monitor",
     "Sayaka",
     "定时监控微博用户动态并推送到指定会话，支持按会话分组订阅不同博主。",
-    "v1.20.1",
+    "v1.20.2",
     "https://github.com/jiantoucn/astrbot_plugin_weibo_monitor",
 )
 class WeiboMonitor(Star):
@@ -2628,6 +2632,25 @@ class WeiboMonitor(Star):
         """
         attempted_targets = list(dict.fromkeys(targets))
         text_content = self._format_post_text(post, msg_format)
+        relay_umo = str(self._get_config("video_relay_umo", "") or "").strip()
+        relay_platform_id = None
+        record_targets = []
+        if relay_umo:
+            try:
+                relay_platform_id, _ = parse_qq_private_umo(relay_umo)
+                for target in attempted_targets:
+                    parts = str(target).split(":", 2)
+                    if (
+                        len(parts) == 3
+                        and parts[0].strip() == relay_platform_id
+                        and parts[1].strip().casefold()
+                        in {"friendmessage", "groupmessage"}
+                    ):
+                        record_targets.append(target)
+            except (TypeError, ValueError) as e:
+                self.plugin_logger.warning(
+                    f"微博 QQ 私聊中转配置无效，回退为分条发送: {e}"
+                )
 
         # 图片下载和推送
         image_enabled = self._get_config("enable_image_download", True)
@@ -2659,10 +2682,136 @@ class WeiboMonitor(Star):
         failed_text_targets = []
         successful_image_targets = []
         image_failed_targets = []
-        for target in attempted_targets:
+        successful_video_targets = []
+        video_failed_targets = []
+        video_component_failed = False
+        video_download_failed = False
+        video_enabled = self._get_config("enable_video_download", True)
+        video_available = bool(post.get("video_info"))
+        video_posts = post.get("_video_posts", [post] if video_available else [])
+        preloaded_video_paths = None
+
+        # 先准备完整媒体列表，再用中转消息 ID 组装聊天记录。单个媒体各自占一条 Node。
+        if record_targets and (image_paths or (video_enabled and video_available)):
+            can_send_record = True
+            record_video_components = []
+            if video_enabled and video_available:
+                preloaded_video_paths = []
+                for video_post in video_posts:
+                    video_path = None
+                    try:
+                        dl_timeout = self._get_config("video_download_timeout", 60)
+                        if dl_timeout > 0:
+                            video_path = await asyncio.wait_for(
+                                self._download_post_video(video_post), timeout=dl_timeout
+                            )
+                        else:
+                            video_path = await self._download_post_video(video_post)
+                    except asyncio.CancelledError:
+                        raise
+                    except asyncio.TimeoutError:
+                        self.plugin_logger.warning(
+                            f"视频下载超时（{dl_timeout}秒），已跳过: {post.get('link', 'unknown')}"
+                        )
+                        video_download_failed = True
+                    except Exception as e:
+                        self.plugin_logger.error(f"WeiboMonitor: 视频下载失败: {e}")
+                        video_download_failed = True
+
+                    preloaded_video_paths.append(video_path)
+                    if not video_path:
+                        video_download_failed = True
+                        can_send_record = False
+                        continue
+                    try:
+                        record_video_components.append(
+                            Comp.Video.fromFileSystem(path=video_path)
+                        )
+                    except Exception as e:
+                        video_component_failed = True
+                        can_send_record = False
+                        self.plugin_logger.error(
+                            f"WeiboMonitor: 构造视频消息失败: {e}"
+                        )
+
+                if not video_posts:
+                    can_send_record = False
+
+            relay_video_nodes = []
+            if can_send_record and record_video_components:
+                try:
+                    send_timeout = self._get_config("video_send_timeout", 60)
+                    relay_coro = send_videos_to_private_relay(
+                        self.context, relay_umo, record_video_components
+                    )
+                    if send_timeout > 0:
+                        relay_video_nodes = await asyncio.wait_for(
+                            relay_coro, timeout=send_timeout
+                        )
+                    else:
+                        relay_video_nodes = await relay_coro
+                    if len(relay_video_nodes) != len(record_video_components):
+                        raise ValueError("中转返回的视频消息数与上传数不一致")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    can_send_record = False
+                    self.plugin_logger.warning(
+                        f"微博视频中转失败，回退为分条发送: {e}"
+                    )
+
+            if can_send_record and (image_paths or relay_video_nodes):
+                try:
+                    nodes = [
+                        Comp.Node(
+                            name="微博监控",
+                            uin="0",
+                            content=[Comp.Plain(text_content)],
+                        )
+                    ]
+                    for image_path in image_paths:
+                        nodes.append(
+                            Comp.Node(
+                                name="微博监控",
+                                uin="0",
+                                content=[Comp.Image(file=image_path)],
+                            )
+                        )
+                    nodes.extend(relay_video_nodes)
+                    record_chain = MessageChain()
+                    record_chain.chain.append(Comp.Nodes(nodes=nodes))
+                except Exception as e:
+                    can_send_record = False
+                    self.plugin_logger.warning(
+                        f"微博聊天记录构造失败，回退为分条发送: {e}"
+                    )
+
+            if can_send_record and (image_paths or relay_video_nodes):
+                for target in record_targets:
+                    try:
+                        await self._send_message_with_timeout(target, record_chain)
+                        successful_text_targets.append(target)
+                        if image_paths:
+                            successful_image_targets.append(target)
+                        if relay_video_nodes:
+                            successful_video_targets.append(target)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        self.plugin_logger.warning(
+                            f"微博聊天记录发送到 {target} 失败，回退为分条发送: {e}"
+                        )
+
+        separate_targets = [
+            target for target in attempted_targets
+            if target not in successful_text_targets
+        ]
+        separate_successful_text_targets = []
+        for target in separate_targets:
             try:
                 await self._send_message_with_timeout(target, text_chain)
                 successful_text_targets.append(target)
+                separate_successful_text_targets.append(target)
             except Exception as e:
                 failed_text_targets.append(target)
                 self.plugin_logger.error(
@@ -2691,36 +2840,35 @@ class WeiboMonitor(Star):
                 )
 
         # 视频下载和推送
-        video_enabled = self._get_config("enable_video_download", True)
-        video_available = bool(post.get("video_info"))
-        successful_video_targets = []
-        video_failed_targets = []
-        video_component_failed = False
-        video_download_failed = False
-        video_posts = post.get("_video_posts", [post] if video_available else [])
-        for video_post in video_posts:
+        for video_index, video_post in enumerate(video_posts):
             video_path = None
             if video_enabled and video_available:
                 self.plugin_logger.info(
                     f"检测到视频微博，开始下载: {post.get('link', 'unknown')}"
                 )
-                try:
-                    dl_timeout = self._get_config("video_download_timeout", 60)
-                    if dl_timeout > 0:
-                        video_path = await asyncio.wait_for(
-                            self._download_post_video(video_post), timeout=dl_timeout
+                if preloaded_video_paths is not None:
+                    if video_index < len(preloaded_video_paths):
+                        video_path = preloaded_video_paths[video_index]
+                else:
+                    try:
+                        dl_timeout = self._get_config("video_download_timeout", 60)
+                        if dl_timeout > 0:
+                            video_path = await asyncio.wait_for(
+                                self._download_post_video(video_post), timeout=dl_timeout
+                            )
+                        else:
+                            video_path = await self._download_post_video(video_post)
+                    except asyncio.CancelledError:
+                        raise
+                    except asyncio.TimeoutError:
+                        self.plugin_logger.warning(
+                            f"视频下载超时（{dl_timeout}秒），已跳过: {post.get('link', 'unknown')}"
                         )
-                    else:
-                        video_path = await self._download_post_video(video_post)
-                except asyncio.TimeoutError:
-                    self.plugin_logger.warning(
-                        f"视频下载超时（{dl_timeout}秒），已跳过: {post.get('link', 'unknown')}"
-                    )
-                    video_path = None
-                    video_download_failed = True
-                except Exception as e:
-                    self.plugin_logger.error(f"WeiboMonitor: 视频下载失败: {e}")
-                    video_download_failed = True
+                        video_path = None
+                        video_download_failed = True
+                    except Exception as e:
+                        self.plugin_logger.error(f"WeiboMonitor: 视频下载失败: {e}")
+                        video_download_failed = True
                 if not video_path:
                     video_download_failed = True
                     video_failed_targets.extend(successful_text_targets)
@@ -2734,7 +2882,7 @@ class WeiboMonitor(Star):
                     video_component_failed = True
                     video_failed_targets.extend(successful_text_targets)
                     self.plugin_logger.error(f"WeiboMonitor: 构造视频消息失败: {e}")
-                for target in successful_text_targets:
+                for target in separate_successful_text_targets:
                     if video_chain is None:
                         break
                     try:

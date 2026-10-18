@@ -57,8 +57,9 @@
   "delivery_settings": {
     "type": "object",
     "description": "消息投递",
-    "hint": "防止单个消息平台或适配器长时间无响应时卡住整个插件。",
+    "hint": "配置微博消息记录的媒体中转，以及主动消息超时。",
     "items": {
+      "video_relay_umo": {"type": "string", "default": "", "description": "QQ 私聊媒体中转会话", "hint": "可选。填写 QQ OneBot V11（aiocqhttp）平台内目标私聊中 /weibo_umo 返回的完整 UMO（platform:FriendMessage:QQ号）。同一平台目标会将正文、图片和视频整理为一条聊天记录；首条为正文，每张图片、每个视频各占一条。视频先发到该私聊，再按返回的消息 ID 引用进聊天记录。其他平台目标和留空时维持分条发送。"},
       "message_send_timeout": {"type": "int", "default": 60, "description": "普通消息发送超时（秒）", "hint": "适用于文字、图片、热搜、总结和配置提醒；0 表示不限制。视频仍使用独立的视频发送超时。"}
     }
   },
@@ -115,6 +116,7 @@
   "video_send_timeout": {"type": "int", "default": 60, "invisible": true},
   "temp_media_retention_minutes": {"type": "int", "default": 10, "invisible": true},
   "message_send_timeout": {"type": "int", "default": 60, "invisible": true},
+  "video_relay_umo": {"type": "string", "default": "", "invisible": true},
   "filter_keywords": {"type": "list", "item_type": "string", "default": [], "invisible": true},
   "whitelist_keywords": {"type": "list", "item_type": "string", "default": [], "invisible": true},
   "send_original": {"type": "bool", "default": true, "invisible": true},
