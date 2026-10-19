@@ -126,6 +126,15 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
             {"play_info": {"bitrate": 200, "url": "https://video/high"}},
         ]}}})
         self.assertEqual(video["url"], "https://video/high")
+        desktop_video = plugin._extract_video_info({"page_info": {
+            "type": "11", "object_type": "video", "media_info": {
+                "media_type": "video", "format": "mp4", "playback_list": [
+                    {"play_info": {"bitrate": 503643, "mime": "video/mp4", "url": "https://video/desktop.mp4"}},
+                    {"play_info": {"mime": "image/jpeg", "url": "https://image/cover.jpg"}},
+                ],
+            },
+        }})
+        self.assertEqual(desktop_video["url"], "https://video/desktop.mp4")
 
 
 

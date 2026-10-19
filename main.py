@@ -2349,19 +2349,27 @@ class WeiboMonitor(Star):
 
     def _extract_video_info(self, mblog: dict) -> Optional[dict]:
         """从微博博文数据中提取视频信息。
-        若 page_info.type == "video" 则返回包含 url、cover 等的字典，
-        否则返回 None。被转发微博的媒体单独提取，由会话设置决定是否发送。
+        page_info 的 type、object_type 或 media_info.media_type 标记为 video
+        时，返回包含 url、cover 等的字典。被转发微博的媒体单独提取，
+        由会话设置决定是否发送。
         """
         page_info = mblog.get("page_info")
-        if not (
-            page_info
-            and isinstance(page_info, dict)
-            and page_info.get("type") == "video"
-        ):
+        if not page_info or not isinstance(page_info, dict):
             return None
 
         urls = page_info.get("urls") or {}
         media_info = page_info.get("media_info") or {}
+        is_video = any(
+            str(value or "").casefold() == "video"
+            for value in (
+                page_info.get("type"),
+                page_info.get("object_type"),
+                media_info.get("media_type") if isinstance(media_info, dict) else None,
+            )
+        )
+        if not is_video:
+            return None
+
         video_url = None
         playback = [
             item.get("play_info") for item in (media_info.get("playback_list") or [])
