@@ -179,3 +179,4 @@ CODE_REVIEW_REPORT.md
 !/tests/test_weibo_session.py
 !/tests/test_browser_cookie_state.py
 !/tests/test_retweet_delivery.py
+!/tests/test_shared_link_resolver_cookies.py

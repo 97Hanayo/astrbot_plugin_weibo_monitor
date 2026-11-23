@@ -11,6 +11,7 @@ import logging
 import copy
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
 from urllib.parse import quote
 from astrbot.api import logger as astrbot_logger
@@ -68,6 +69,8 @@ CONFIG_GROUPS = {
     "account_settings": (
         "weibo_urls",
         "weibo_cookie",
+        "use_link_resolver_cookies",
+        "shared_cookie_path",
         "cookie_notification_target",
         "auto_refresh_cookies",
         "cookie_refresh_interval_hours",
@@ -149,6 +152,9 @@ class WeiboMonitor(Star):
         )
         self._cookie_refresh_lock = asyncio.Lock()
         self._last_cookie_refresh_at = 0.0
+        self._shared_cookie_cache_sig: Optional[Tuple[str, int, int]] = None
+        self._shared_cookie_cache_source: str = ""
+        self._shared_cookie_skip_logged: bool = False
 
         # 初始化日志
         self.plugin_logger = logging.getLogger("astrbot_plugin_weibo_monitor")
@@ -903,16 +909,85 @@ class WeiboMonitor(Star):
             match = re.search(r"(\d{2}:\d{2}:\d{2})", text)
             return match.group(1) if match else ""
 
+    def _get_shared_cookie_path(self) -> Optional[Path]:
+        """返回与 astrbot_plugin_link_resolver 共用的微博 Cookie 文件路径。"""
+        get_config = getattr(self, "_get_config", None)
+        if not callable(get_config):
+            return None
+        if not get_config("use_link_resolver_cookies", True):
+            return None
+        custom = str(get_config("shared_cookie_path", "") or "").strip()
+        if custom:
+            return Path(custom)
+        data_dir = getattr(self, "data_dir", None)
+        if data_dir is None:
+            return None
+        return (
+            Path(data_dir).parent
+            / "astrbot_plugin_link_resolver"
+            / "cookies"
+            / "weibo_cookies.txt"
+        )
+
+    def _load_shared_cookie_source(self) -> str:
+        """按文件 mtime/size 热加载 link_resolver 的微博 Cookie 文件。"""
+        shared_path = self._get_shared_cookie_path()
+        if shared_path is None:
+            return ""
+        try:
+            stat = shared_path.stat()
+        except OSError:
+            return ""
+        sig = (str(shared_path), stat.st_mtime_ns, stat.st_size)
+        if sig == getattr(self, "_shared_cookie_cache_sig", None):
+            return getattr(self, "_shared_cookie_cache_source", "")
+        try:
+            raw = normalize_cookie_source(shared_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError):
+            return ""
+        previous = getattr(self, "_shared_cookie_cache_source", "")
+        self._shared_cookie_cache_sig = sig
+        self._shared_cookie_cache_source = raw
+        if raw and raw != previous and hasattr(self, "plugin_logger"):
+            self.plugin_logger.info(
+                "WeiboMonitor: 已热加载 link_resolver 共享微博 Cookie: %s",
+                shared_path,
+            )
+        return raw
+
+    def _is_using_shared_cookies(self) -> bool:
+        loader = getattr(self, "_load_shared_cookie_source", None)
+        return bool(loader()) if callable(loader) else False
+
     def _get_cookie_value(self) -> str:
         """返回规范化 Cookie，兼容请求头与 Netscape 文件内容。"""
+        loader = getattr(self, "_load_shared_cookie_source", None)
+        shared = loader() if callable(loader) else ""
+        if shared:
+            return normalize_cookie_text(shared)
         value = self._get_config("weibo_cookie", "")
         return normalize_cookie_text(str(value)) if value is not None else ""
 
     def _get_cookie_source(self) -> str:
+        loader = getattr(self, "_load_shared_cookie_source", None)
+        shared = loader() if callable(loader) else ""
+        if shared:
+            return shared
         return normalize_cookie_source(self._get_config("weibo_cookie", ""))
 
     def _initialize_cookie_value(self):
         """识别手动配置更新，同时保留框架保存失败后的文件续期值。"""
+        loader = getattr(self, "_load_shared_cookie_source", None)
+        shared_cookie = loader() if callable(loader) else ""
+        if shared_cookie:
+            shared_path = self._get_shared_cookie_path()
+            self.plugin_logger.info(
+                "WeiboMonitor: 已启用共享模式，使用 link_resolver 微博 Cookie (%s)；"
+                "本插件将跳过独立 Cookie 保活与写回",
+                shared_path,
+            )
+            return
+
         configured_cookie = self._get_cookie_source()
         file_cookie = self.cookie_file.load()
         if not file_cookie:
@@ -1065,6 +1140,8 @@ class WeiboMonitor(Star):
 
     async def _capture_weibo_cookie_updates(self, response: httpx.Response):
         """接收微博 Set-Cookie 并回写本地文件，尽可能延续服务端会话。"""
+        if getattr(self, "_is_using_shared_cookies", lambda: False)():
+            return
         if not self._get_config("auto_refresh_cookies", True):
             return
         if not response.request.headers.get("Cookie"):
@@ -1154,6 +1231,14 @@ class WeiboMonitor(Star):
 
     async def _refresh_weibo_cookie_session(self):
         """优先用 Playwright 获取浏览器最终 Cookie，失败时降级到 HTTPX。"""
+        if getattr(self, "_is_using_shared_cookies", lambda: False)():
+            if not getattr(self, "_shared_cookie_skip_logged", False):
+                self._shared_cookie_skip_logged = True
+                self._log_cookie_refresh(
+                    "info",
+                    "WeiboMonitor: 当前共用 astrbot_plugin_link_resolver 的微博 Cookie，跳过本插件保活以避免互相刷新冲突",
+                )
+            return
         if not self._get_config("auto_refresh_cookies", True):
             return
         cookie = self._get_cookie_value()
@@ -3313,6 +3398,15 @@ class WeiboMonitor(Star):
     @filter.command("weibo_cookie")
     async def weibo_cookie(self, event: AstrMessageEvent, cookie: str = ""):
         """更换微博 Cookie 并自动重载插件"""
+        if self._is_using_shared_cookies():
+            shared_path = self._get_shared_cookie_path()
+            yield event.plain_result(
+                f"ℹ️ 当前已开启“共用 link_resolver 微博 Cookie”，正在读取：{shared_path}\n"
+                "请直接在 astrbot_plugin_link_resolver 中使用 /weibo_login_scan、/weibo_login_code "
+                "或后台配置更新微博 Cookie（本插件会自动热加载）；如需独立管理，请先关闭 use_link_resolver_cookies。"
+            )
+            return
+
         message_str: str = event.message_str or ""
         if message_str:
             parts = message_str.split(maxsplit=1)
@@ -3712,6 +3806,10 @@ class WeiboMonitor(Star):
         status_lines.append(
             f"- Cookie：{cookie_labels.get(readiness['cookie_status'], '⏳ 待验证')}"
         )
+        if self._is_using_shared_cookies():
+            status_lines.append(
+                f"- Cookie 来源：🔗 共用 astrbot_plugin_link_resolver（{self._get_shared_cookie_path()}，由 link_resolver 统一保活）"
+            )
         status_lines.append(
             "- 敏感命令：/weibo_export、/weibo_import、/weibo_cookie 仅 AstrBot "
             "全局管理员可用（请在 AstrBot 的 admins_id/“管理员 ID”中配置，"
